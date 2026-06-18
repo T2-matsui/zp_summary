@@ -1,0 +1,36 @@
+{
+  "_comment": "このファイルは雛形です。コピーして config.json として使ってください (config.json は .gitignore で除外)。",
+
+  "channel": ["C0123ABC", "C0456DEF"],
+  "limit": 200,
+  "threads": false,
+
+  "content_date": "yesterday",
+  "_comment_content_date": "yyyy-mm-dd / today / yesterday / tomorrow / N_days_ago / N_days_later",
+
+  "extract": "tracking",
+  "_comment_extract": "raw / driving / tracking",
+
+  "tracking_source": "teams",
+  "_comment_tracking_source": "excel = Excelから時刻取得 / teams = Teams会議+共有予定表から取得",
+
+  "track_calendars": [
+    "driver-a@yourcompany.com",
+    "driver-b@yourcompany.com",
+    "driver-c@yourcompany.com"
+  ],
+  "_comment_track_calendars": "tracking_source=teamsで、共有された予定表を持つドライバーのメール/UPN",
+
+  "name_pattern": "^運行",
+  "_comment_name_pattern": "Slack投稿名の正規表現フィルタ (デフォルトは「運行」で始まる投稿のみ)",
+
+  "append": false,
+  "_comment_append": "true: 既存のresult.json/legs.jsonに追記 (URL重複は自動スキップ)",
+
+  "out": "result.json",
+  "legs_out": "legs.json",
+  "logs_out": "logs.json",
+
+  "notify_webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
+  "_comment_notify_webhook_url": "完了通知用のSlack Incoming Webhook URL"
+}

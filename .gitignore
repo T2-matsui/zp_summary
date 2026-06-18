@@ -1,0 +1,74 @@
+# --- 秘密情報・認証 ---
+.env
+.env.*
+!.env.example 
+*.token
+*_token.txt
+*.bin
+*.msal*
+.slack_attachment_reader_msal_cache.bin
+
+# --- ユーザー設定・出力データ ---
+config.json
+result.json
+legs.json
+logs.json
+stderr.log
+stdout.log
+*.log
+
+# --- 個人情報を含む可能性 ---
+calendar_dump.json
+debug_*.json
+debug_*.txt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- venv ---
+venv/
+env/
+ENV/
+.venv/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+
+# --- 一時ファイル ---
+*.tmp
+*.bak
+*.orig
+~$*
+
+# --- Excel一時ファイル ---
+~$*.xlsx
+~$*.xls
