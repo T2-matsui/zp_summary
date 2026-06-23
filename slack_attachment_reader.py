@@ -1199,21 +1199,40 @@ def build_legs_record(meta: dict, day_data: dict | None, url: str) -> list:
 def is_legs_record_complete(rec) -> tuple[bool, list]:
     """legsレコードの全フィールドが埋まっているかチェック。
     戻り値: (完全か, 空フィールド名のリスト)
+    "---" "--" "-" "未定" "TBD" "なし" 等のプレースホルダも「未取得」扱い。
     """
+    # プレースホルダパターン (空白除去後にこれらにマッチしたら「未取得」)
+    PLACEHOLDER_PATTERNS = {
+        "", "-", "--", "---", "----", "−", "—", "ー",
+        "未定", "未取得", "未設定", "なし", "無し", "tbd", "TBD",
+        "n/a", "N/A", "na", "NA", "なし", "?", "？", "不明",
+    }
+
+    def is_placeholder(value) -> bool:
+        if value is None:
+            return True
+        s = str(value).strip()
+        if s in PLACEHOLDER_PATTERNS:
+            return True
+        # ハイフンだけで構成されているケース (---- など長さ可変)
+        if s and all(ch in "-−—ー" for ch in s):
+            return True
+        return False
+
     missing: list = []
     if not isinstance(rec, list) or len(rec) < 4:
         return False, ["record_format"]
 
-    if not rec[0]:
+    if is_placeholder(rec[0]):
         missing.append("Trackname")
     if not rec[1] or "|" not in (rec[1] or ""):
         missing.append("Date")
-    if not rec[2]:
+    if is_placeholder(rec[2]):
         missing.append("Time-range")
 
     meta = rec[3] if isinstance(rec[3], dict) else {}
     for key in ["SW-version", "selfdrive_section", "loaded_luggage", "url"]:
-        if not meta.get(key):
+        if is_placeholder(meta.get(key)):
             missing.append(key)
 
     return len(missing) == 0, missing
@@ -1337,6 +1356,9 @@ def main() -> None:
                              "Slackから取得しない (高速化)")
     parser.add_argument("--notify-webhook-url", default=None,
                         help="完了時にこのSlack Incoming WebhookへPOSTして結果通知")
+    parser.add_argument("--start-notify-webhook-url", default=None,
+                        help="開始時にこのSlack Incoming WebhookへPOSTして開始通知 "
+                             "(個人DM用Webhookに設定すると、開始通知だけDMで受け取れる)")
     parser.add_argument("--out", help="結果をファイルに出力 (省略時は標準出力)")
 
     # configの未知キーを警告 (タイポ防止)
@@ -1374,6 +1396,17 @@ def main() -> None:
     if args.content_date and target_date:
         print(f"[情報] content_date = {target_date.isoformat()} "
               f"(指定: {args.content_date!r})", file=sys.stderr)
+
+    # 開始通知 (個人DM等のWebhookに送信)
+    if args.start_notify_webhook_url:
+        start_lines = ["🚀 zp_summary の実行を開始しました"]
+        if target_date:
+            start_lines.append(f"対象日: {target_date.isoformat()}")
+        start_lines.append(f"実行開始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if args.extract == "tracking":
+            mode = args.tracking_source
+            start_lines.append(f"モード: tracking ({mode})")
+        send_slack_notification(args.start_notify_webhook_url, "\n".join(start_lines))
 
     # logs.json を読み込み、最新投稿日より新しい投稿のみ取得するよう since_ts を調整
     existing_logs: list = []
