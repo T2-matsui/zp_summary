@@ -668,7 +668,7 @@ def get_teams_meeting(url: str, graph_token: str) -> dict | None:
 
 def parse_teams_subject(subject: str) -> dict:
     """Teams会議件名から Trackname / Customer / Route を抽出。
-    形式: 【GIGA■■】○○様 実証 往路 関東→関西
+    形式: 【giga■■】○○様 実証 往路 関東→関西
     """
     result: dict = {}
     if not subject:
@@ -1183,6 +1183,18 @@ def build_legs_record(meta: dict, day_data: dict | None, url: str) -> list:
             except (ValueError, IndexError):
                 pass
 
+    def _giga(v):
+        # 出力上の "GIGA" は小文字 "giga" に統一
+        return v.replace("GIGA", "giga") if isinstance(v, str) else v
+
+    track = _giga(track)
+    # Tracknameが「重要運行」のときは、loaded_luggageの【gigaXX】から
+    # giga番号を拾って "重要運行_gigaXX" にする
+    if track == "重要運行":
+        m = re.search(r"(giga\d+)", _giga(meta.get("Customer", "")), re.IGNORECASE)
+        if m:
+            track = f"重要運行_{m.group(1).lower()}"
+
     return [
         track,
         f"{track_num}|{date_str}" if date_str else track_num,
@@ -1190,7 +1202,7 @@ def build_legs_record(meta: dict, day_data: dict | None, url: str) -> list:
         {
             "SW-version": meta.get("SW-ver", ""),
             "selfdrive_section": meta.get("Route", ""),
-            "loaded_luggage": meta.get("Customer", ""),
+            "loaded_luggage": _giga(meta.get("Customer", "")),
             "url": url,
         },
     ]
@@ -2033,7 +2045,11 @@ def main() -> None:
                 if legs_records:
                     for i, lrec in enumerate(legs_records):
                         ok, _ = is_legs_record_complete(lrec)
-                        if not ok:
+                        track_name = (
+                            lrec[0] if isinstance(lrec, list) and lrec else ""
+                        )
+                        # giga番号が拾えず「重要運行」のままならfailed扱い
+                        if not ok or track_name == "重要運行":
                             incomplete_rec_indices.add(i)
                     if incomplete_rec_indices:
                         status_line = (
@@ -2064,8 +2080,18 @@ def main() -> None:
                     # 対応する legs_record の完全性を見て印を付ける
                     marker = ""
                     if i in incomplete_rec_indices:
-                        _, missing = is_legs_record_complete(legs_records[i])
-                        marker = f" ⚠️ 未取得: {', '.join(missing)}"
+                        lrec = legs_records[i]
+                        _, missing = is_legs_record_complete(lrec)
+                        track_name = (
+                            lrec[0] if isinstance(lrec, list) and lrec else ""
+                        )
+                        parts = []
+                        if track_name == "重要運行":
+                            parts.append("Trackname未確定(giga番号取得失敗)")
+                        if missing:
+                            parts.append(f"未取得: {', '.join(missing)}")
+                        if parts:
+                            marker = " ⚠️ " + " / ".join(parts)
 
                     lines.append("")
                     lines.append(f"{track}{marker}")
