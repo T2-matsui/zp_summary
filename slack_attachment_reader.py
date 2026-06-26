@@ -1276,6 +1276,27 @@ def legs_dedup_key(rec) -> tuple:
     return (track, date_str, direction)
 
 
+def atomic_write_text(path: str, text: str, encoding: str = "utf-8") -> None:
+    """同一ディレクトリの一時ファイルに書いてから os.replace で差し替える。
+    書き込み途中でクラッシュしても元ファイルは無傷のまま残る。"""
+    p = Path(path)
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except Exception:
+        # 失敗時は一時ファイルの残骸を掃除して元ファイルを守る
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def send_slack_notification(webhook_url: str, text: str) -> None:
     """Slack Incoming Webhook にメッセージを送信"""
     try:
@@ -1916,7 +1937,7 @@ def main() -> None:
             chunks.append(header + "\n" + text)
         result = "\n".join(chunks)
     if args.out:
-        Path(args.out).write_text(result, encoding="utf-8")
+        atomic_write_text(args.out, result, encoding="utf-8")
         print(f"結果を {args.out} に保存しました。", file=sys.stderr)
     else:
         print(result)
@@ -1986,7 +2007,8 @@ def main() -> None:
             legs_new_count = len(new_legs)
             final_legs = existing_legs + new_legs
             legs_total_count = len(final_legs)
-            Path(args.legs_out).write_text(
+            atomic_write_text(
+                args.legs_out,
                 json.dumps(final_legs, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
@@ -2025,7 +2047,8 @@ def main() -> None:
                 existing_log_urls.add(url)
 
             final_logs = existing_logs + new_log_entries
-            Path(args.logs_out).write_text(
+            atomic_write_text(
+                args.logs_out,
                 json.dumps(final_logs, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
