@@ -1188,13 +1188,23 @@ def build_legs_record(meta: dict, day_data: dict | None, url: str) -> list:
         # 出力上の "GIGA" は小文字 "giga" に統一
         return v.replace("GIGA", "giga") if isinstance(v, str) else v
 
+    def _strip_giga_tag(v):
+        # loaded_luggage 先頭の 【gigaXX】 表記を除去
+        if not isinstance(v, str):
+            return v
+        return re.sub(r"^\s*【\s*giga\d+\s*】\s*", "", v, flags=re.IGNORECASE)
+
     track = _giga(track)
     # Tracknameが「重要運行」のときは、loaded_luggageの【gigaXX】から
-    # giga番号を拾って "重要運行_gigaXX" にする
+    # giga番号を拾って Trackname="gigaXX"、Track-num=番号、日付末尾に "_重要運行" を付与
     if track == "重要運行":
-        m = re.search(r"(giga\d+)", _giga(meta.get("Customer", "")), re.IGNORECASE)
+        m = re.search(r"giga(\d+)", _giga(meta.get("Customer", "")), re.IGNORECASE)
         if m:
-            track = f"重要運行_{m.group(1).lower()}"
+            giga_num = m.group(1)          # 例: "03"
+            track = f"giga{giga_num}"       # 例: "giga03"
+            track_num = giga_num            # rec[1] 先頭を giga 番号に
+            if date_str:
+                date_str = f"{date_str}_重要運行"
 
     return [
         track,
@@ -1203,7 +1213,7 @@ def build_legs_record(meta: dict, day_data: dict | None, url: str) -> list:
         {
             "SW-version": meta.get("SW-ver", ""),
             "selfdrive_section": meta.get("Route", ""),
-            "loaded_luggage": _giga(meta.get("Customer", "")),
+            "loaded_luggage": _strip_giga_tag(_giga(meta.get("Customer", ""))),
             "url": url,
         },
     ]
