@@ -47,6 +47,7 @@ SharePoint連携 (任意):
 
 import argparse
 import io
+import json
 import os
 import re
 import sys
@@ -1948,7 +1949,8 @@ def main() -> None:
         try:
             existing_legs: list = []
             existing_keys: set = set()
-            if os.path.exists(args.legs_out):
+            # append=True のときのみ既存を読み込んでマージ。False なら上書き。
+            if args.append and os.path.exists(args.legs_out):
                 # BOMを見て適切なエンコーディングで読む
                 with open(args.legs_out, "rb") as f:
                     raw = f.read()
@@ -1983,11 +1985,18 @@ def main() -> None:
                         print(f"[警告] {args.legs_out} のJSONが壊れている "
                               f"({e})。新規作成扱いに切替", file=sys.stderr)
                         existing_legs = []
+                # 既存レコードの重複を掃除しつつ dedup キーを構築
+                # (legs.json のレコードは list 形式。legs_dedup_key は両対応)
+                deduped_existing: list = []
                 for rec in existing_legs:
-                    if isinstance(rec, dict):
-                        k = legs_dedup_key(rec)
-                        if any(k):
-                            existing_keys.add(k)
+                    k = legs_dedup_key(rec)
+                    if any(k):
+                        if k in existing_keys:
+                            legs_skipped_count += 1
+                            continue
+                        existing_keys.add(k)
+                    deduped_existing.append(rec)
+                existing_legs = deduped_existing
                 if existing_legs:
                     print(f"[legs] 既存 {len(existing_legs)} 件を読み込み",
                           file=sys.stderr)
@@ -2065,7 +2074,19 @@ def main() -> None:
         incomplete_rec_indices: set = set()
         if args.extract == "tracking":
             try:
-                if legs_records:
+                if not legs_records:
+                    # 0件の場合は success (失敗ではなく対象なし扱い)
+                    status_line = "✅ success: (今回追加されたレコードはありません)"
+                elif legs_new_count == 0 and legs_skipped_count > 0:
+                    # 今回分は全て既存と重複 → 追加なし。
+                    # 既存レコードの不完全さは今回のエラーではないため、
+                    # failed より優先して success でも failed でもない中立表示にする。
+                    status_line = (
+                        f"🔁 skipped: 全て既存レコードと重複のため追加なし "
+                        f"({legs_skipped_count} 件スキップ)"
+                    )
+                else:
+                    # 新規追加あり → 完全性チェック
                     for i, lrec in enumerate(legs_records):
                         ok, _ = is_legs_record_complete(lrec)
                         track_name = (
@@ -2079,9 +2100,12 @@ def main() -> None:
                             f"❌ failed: 運行記録に不完全なレコードがあります "
                             f"({len(incomplete_rec_indices)}/{len(legs_records)} 件)"
                         )
-                else:
-                    # 0件の場合は success (失敗ではなく対象なし扱い)
-                    status_line = "✅ success: (今回追加されたレコードはありません)"
+                    elif legs_skipped_count > 0:
+                        # 一部新規・一部重複
+                        status_line = (
+                            f"✅ success: {legs_new_count} 件追加 "
+                            f"(重複スキップ {legs_skipped_count} 件)"
+                        )
             except NameError:
                 pass
 

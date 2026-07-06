@@ -48,14 +48,25 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
    - legs.json: 配列フォーマット (重複スキップ)
    - logs.json: 投稿日履歴の追記
    ↓
-9. Slack 完了通知 → 運行チャンネル (✅ success または ❌ failed)
+9. Slack 完了通知 → 運行チャンネル (✅ success / ❌ failed / 🔁 skipped)
 ```
+
+### 完了通知のステータス
+
+| ステータス | 条件 |
+|---|---|
+| `✅ success` | 新規レコードを追加 (問題なし)。一部重複した場合は「N 件追加 (重複スキップ M 件)」と併記 |
+| `❌ failed` | 新規追加分に不完全なレコード (未取得項目 / giga番号未確定の「重要運行」) がある |
+| `🔁 skipped` | 今回分が **全て既存と重複** で追加なし。success でも failed でもない中立表示。既存レコードの不完全さは failed 扱いにしない |
+| `✅ success (対象なし)` | 対象日に該当投稿が 0 件 |
+
+いずれのステータスでも `対象日: YYYY-MM-DD` の行が付く。
 
 ### 認証
 
 | 認証情報 | 用途 | scope/権限 |
 |---|---|---|
-| Slack Bot Token (`xoxb-`) | チャンネル読み取り、添付DL | `channels:history` `channels:read` `files:read` `users:read` `incoming-webhook` |
+| Slack Bot Token (`xoxb-`) | チャンネル読み取り、添付DL | `channels:history` `channels:read` `groups:history` `groups:read` `files:read` `users:read` `incoming-webhook` |
 | Slack Webhook URL (開始) | 個人DM通知 | scope不要 (URL自体が認証情報) |
 | Slack Webhook URL (完了) | 運行チャンネル通知 | scope不要 |
 | Microsoft Graph (MSAL) | Teams 会議情報 / ドライバー予定表 | `Files.Read.All` `OnlineMeetings.Read` `Calendars.Read` `Calendars.Read.Shared` |
@@ -81,7 +92,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ```
 
 ### `legs.json`
-往路/復路ごとに区切った配列フォーマット (重複スキップ)。
+往路/復路ごとに区切った配列フォーマット。
 
 ```json
 [
@@ -91,6 +102,15 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
     "loaded_luggage": "QP様", "url": "https://..."}]
 ]
 ```
+
+**append と重複スキップの挙動**
+
+| `config.json` の `append` | 動作 |
+|---|---|
+| `false` (既定) | 既存 legs.json を読まず、今回分だけで **上書き** |
+| `true` | 既存 legs.json に **追記**。重複は自動スキップし、既存内の重複も掃除する |
+
+重複判定キーは **(Trackname, 日付, 往路/復路)**。同じ運行を再取得しても `append: true` なら二重登録されない。過去分から作り直したい場合は下記「[logs.json をリセット](#logsjson-をリセットして再取得したいとき)」を参照。
 
 ### `logs.json`
 既処理スレッドの投稿日履歴。次回実行時の高速化に使用。
@@ -562,9 +582,12 @@ TOKEN=$(grep '^SLACK_BOT_TOKEN' .env | cut -d= -f2 | tr -d '"' | tr -d ' ' | tr 
 curl -s -X POST "https://slack.com/api/auth.test" -H "Authorization: Bearer $TOKEN" -i | grep -i "x-oauth-scopes"
 ```
 
-必要なscope: `channels:history` `channels:read` `files:read` `users:read` `incoming-webhook`
+必要なscope: `channels:history` `channels:read` `groups:history` `groups:read` `files:read` `users:read` `incoming-webhook`
 
-不足があれば Slack App画面で **Bot Token Scopes** に追加 → **reinstall your app** → 新トークンを `.env` に反映。
+- public チャンネルは `channels:history` / `channels:read`
+- **private チャンネルは `groups:history` / `groups:read` が必須**。`conversations.info` すら `missing_scope` を返す場合は対象が private の可能性が高い
+
+不足があれば Slack App画面で **Bot Token Scopes** に追加 → **reinstall your app** → 新トークンを `.env` に反映。private チャンネルでは Bot がメンバーである必要もある (`/invite @アプリ名`)。
 
 ### Slack API error: not_in_channel
 
@@ -689,7 +712,7 @@ git push
 
 ### 定期的な動作確認
 
-毎日のSlack通知 (`✅ success` / `❌ failed`) で結果を確認するのが基本。
+毎日のSlack通知 (`✅ success` / `❌ failed` / `🔁 skipped`) で結果を確認するのが基本。
 通知が来ない日があれば:
 
 ```bash
