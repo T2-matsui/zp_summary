@@ -29,7 +29,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ```
 1. systemd timer 起動 (例: 毎日 12:00)
    ↓
-2. run.sh 実行
+2. run_zp_summary.sh 実行
    ↓
 3. Slack 開始通知 → 個人DM (🚀 実行開始)
    ↓
@@ -133,7 +133,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ~/Downloads/zp_summary/      ← 運用ディレクトリ
 ├── slack_attachment_reader.py   ← メインスクリプト
 ├── calendar_probe.py            ← 動作確認用
-├── run.sh                       ← systemd から呼ばれる起動スクリプト
+├── run_zp_summary.sh            ← systemd から呼ばれる起動スクリプト
 ├── config.json                  ← 設定 (秘密、git除外)
 ├── config.json.example          ← 雛形 (git管理)
 ├── .env                         ← 認証情報 (秘密、git除外)
@@ -222,10 +222,10 @@ python3 slack_attachment_reader.py --config config.json
 ターミナルに表示される URL を開き、コードを入力 → 同意画面で承諾。
 キャッシュは `~/.slack_attachment_reader_msal_cache.bin` に保存され、約90日間は自動更新。
 
-### 8. run.sh 作成
+### 8. run_zp_summary.sh 作成
 
 ```bash
-nano ~/Downloads/zp_summary/run.sh
+nano ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 ```bash
@@ -237,7 +237,7 @@ python3 slack_attachment_reader.py --config config.json
 実行権限付与:
 
 ```bash
-chmod +x ~/Downloads/zp_summary/run.sh
+chmod +x ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 ### 9. systemd ユニット作成
@@ -254,7 +254,7 @@ Description=Run zp_summary slack attachment reader
 
 [Service]
 Type=oneshot
-ExecStart=%h/Downloads/zp_summary/run.sh
+ExecStart=%h/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 #### timer ファイル
@@ -622,16 +622,16 @@ rm ~/.slack_attachment_reader_msal_cache.bin
 
 ### systemd `status=203/EXEC` エラー
 
-`run.sh` が存在しない or 実行権限が無い:
+`run_zp_summary.sh` が存在しない or 実行権限が無い:
 
 ```bash
-ls -la ~/Downloads/zp_summary/run.sh
+ls -la ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 実行権限が無い場合:
 
 ```bash
-chmod +x ~/Downloads/zp_summary/run.sh
+chmod +x ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 ### JSON 構文エラー
