@@ -1,6 +1,6 @@
 # zp_summary
 
-Slack の運行記録チャンネルから親メッセージを読み取り、Microsoft Teams 会議情報および Excel 添付ファイルを組み合わせて、運行記録 (Trackname / 顧客 / 区間 / 時刻 / ドライバー / SW-ver など) を構造化 JSON として出力する社内ツール。
+Slack の運行記録チャンネルから Teams 会議URL を含む親メッセージを読み取り、Microsoft Teams 会議情報（および共有ドライバー予定表）と組み合わせて、運行記録 (Trackname / 顧客 / 区間 / 時刻 / ドライバー / SW-ver など) を構造化 JSON (`legs.json`) として出力する社内ツール。
 
 systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了通知を送る運用想定。
 
@@ -29,7 +29,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ```
 1. systemd timer 起動 (例: 毎日 12:00)
    ↓
-2. run.sh 実行
+2. run_zp_summary.sh 実行
    ↓
 3. Slack 開始通知 → 個人DM (🚀 実行開始)
    ↓
@@ -44,7 +44,6 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
    - Slack本文 → Driver / SW-ver / 区間 / 顧客 を抽出
    ↓
 8. 出力:
-   - result.json: ラベル付きビュー
    - legs.json: 配列フォーマット (重複スキップ)
    - logs.json: 投稿日履歴の追記
    ↓
@@ -66,10 +65,10 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 
 | 認証情報 | 用途 | scope/権限 |
 |---|---|---|
-| Slack Bot Token (`xoxb-`) | チャンネル読み取り、添付DL | `channels:history` `channels:read` `groups:history` `groups:read` `files:read` `users:read` `incoming-webhook` |
+| Slack Bot Token (`xoxb-`) | チャンネル読み取り | `channels:history` `channels:read` `groups:history` `groups:read` `users:read` `incoming-webhook` |
 | Slack Webhook URL (開始) | 個人DM通知 | scope不要 (URL自体が認証情報) |
 | Slack Webhook URL (完了) | 運行チャンネル通知 | scope不要 |
-| Microsoft Graph (MSAL) | Teams 会議情報 / ドライバー予定表 | `Files.Read.All` `OnlineMeetings.Read` `Calendars.Read` `Calendars.Read.Shared` |
+| Microsoft Graph (MSAL) | Teams 会議情報 / ドライバー予定表 | `OnlineMeetings.Read` `Calendars.Read` `Calendars.Read.Shared` |
 
 書き込み・削除権限は一切持たない (Read only)。
 
@@ -77,22 +76,8 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 
 ## 出力ファイル
 
-### `result.json`
-ラベル付きビュー (`__labeled_view__`) 付きの一覧。
-
-```json
-[
-  ["GIGA03", "03|2026/06/02", "13:00/17:00", {
-    "Driver": "U12345", "operator": "oneman",
-    "SW-version": "v1.2.3", "selfdrive section": "東京-大阪",
-    "loaded liggage": "QP様", "url": "https://..."
-  }],
-  {"__labeled_view__": [...]}
-]
-```
-
 ### `legs.json`
-往路/復路ごとに区切った配列フォーマット。
+往路/復路ごとに区切った配列フォーマット。**本ツールの成果物**。
 
 ```json
 [
@@ -133,12 +118,11 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ~/Downloads/zp_summary/      ← 運用ディレクトリ
 ├── slack_attachment_reader.py   ← メインスクリプト
 ├── calendar_probe.py            ← 動作確認用
-├── run.sh                       ← systemd から呼ばれる起動スクリプト
+├── run_zp_summary.sh            ← systemd から呼ばれる起動スクリプト
 ├── config.json                  ← 設定 (秘密、git除外)
 ├── config.json.example          ← 雛形 (git管理)
 ├── .env                         ← 認証情報 (秘密、git除外)
 ├── .env.example                 ← 雛形 (git管理)
-├── result.json                  ← 出力 (git除外)
 ├── legs.json                    ← 出力 (git除外)
 ├── logs.json                    ← 出力 (git除外)
 ├── README.md
@@ -148,7 +132,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ### 2. 依存ライブラリ
 
 ```bash
-pip3 install slack_sdk requests openpyxl python-docx pandas xlrd msal python-dotenv --break-system-packages
+pip3 install slack_sdk requests msal python-dotenv --break-system-packages
 ```
 
 ### 3. `.env` 作成
@@ -174,14 +158,10 @@ nano config.json
   "channel": ["C0XXX", "C0YYY"],
   "limit": 200,
   "content_date": "yesterday",
-  "extract": "tracking",
-  "tracking_source": "teams",
   "track_calendars": [
     "driver-a@example.com",
     "driver-b@example.com"
   ],
-  "name_pattern": "^運行",
-  "out": "result.json",
   "legs_out": "legs.json",
   "logs_out": "logs.json",
   "notify_webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
@@ -222,10 +202,10 @@ python3 slack_attachment_reader.py --config config.json
 ターミナルに表示される URL を開き、コードを入力 → 同意画面で承諾。
 キャッシュは `~/.slack_attachment_reader_msal_cache.bin` に保存され、約90日間は自動更新。
 
-### 8. run.sh 作成
+### 8. run_zp_summary.sh 作成
 
 ```bash
-nano ~/Downloads/zp_summary/run.sh
+nano ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 ```bash
@@ -237,7 +217,7 @@ python3 slack_attachment_reader.py --config config.json
 実行権限付与:
 
 ```bash
-chmod +x ~/Downloads/zp_summary/run.sh
+chmod +x ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 ### 9. systemd ユニット作成
@@ -254,7 +234,7 @@ Description=Run zp_summary slack attachment reader
 
 [Service]
 Type=oneshot
-ExecStart=%h/Downloads/zp_summary/run.sh
+ExecStart=%h/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 #### timer ファイル
@@ -582,7 +562,7 @@ TOKEN=$(grep '^SLACK_BOT_TOKEN' .env | cut -d= -f2 | tr -d '"' | tr -d ' ' | tr 
 curl -s -X POST "https://slack.com/api/auth.test" -H "Authorization: Bearer $TOKEN" -i | grep -i "x-oauth-scopes"
 ```
 
-必要なscope: `channels:history` `channels:read` `groups:history` `groups:read` `files:read` `users:read` `incoming-webhook`
+必要なscope: `channels:history` `channels:read` `groups:history` `groups:read` `users:read` `incoming-webhook`
 
 - public チャンネルは `channels:history` / `channels:read`
 - **private チャンネルは `groups:history` / `groups:read` が必須**。`conversations.info` すら `missing_scope` を返す場合は対象が private の可能性が高い
@@ -608,7 +588,7 @@ Bot がチャンネルに招待されていない:
 `Calendars.Read.Shared` 等が admin consent 必須のテナント設定。
 
 - **Request approval** を押して IT 管理者に依頼
-- 承認まで待つ間は `tracking_source: "excel"` に変更しておく
+- 承認されるまで Teams 会議情報は取得できない (このツールは Teams 会議情報が前提)
 
 ### MSAL トークンキャッシュをリセット
 
@@ -622,16 +602,16 @@ rm ~/.slack_attachment_reader_msal_cache.bin
 
 ### systemd `status=203/EXEC` エラー
 
-`run.sh` が存在しない or 実行権限が無い:
+`run_zp_summary.sh` が存在しない or 実行権限が無い:
 
 ```bash
-ls -la ~/Downloads/zp_summary/run.sh
+ls -la ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 実行権限が無い場合:
 
 ```bash
-chmod +x ~/Downloads/zp_summary/run.sh
+chmod +x ~/Downloads/zp_summary/run_zp_summary.sh
 ```
 
 ### JSON 構文エラー
