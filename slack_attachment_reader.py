@@ -27,6 +27,9 @@ except ImportError:
     pass
 
 JST = timezone(timedelta(hours=9))
+# 対象日(content_date)に対して投稿を拾う窓。運行記録は運行日の前後どちらにも投稿されるため
+# 「投稿日 ±POST_WINDOW_DAYS」で粗く絞り、実日付判定は Teams会議側で行う
+POST_WINDOW_DAYS = 14
 TEAMS_URL_RE = re.compile(
     r'https://teams\.microsoft\.com/l/meetup-join/[^\s<>"\'|]+', re.IGNORECASE)
 
@@ -40,6 +43,9 @@ TRACKING_DATE_TITLE_RE = re.compile(r'(\d{1,2})月(\d{1,2})日')
 TRACKNAME_RE = re.compile(r'【([^】]+)】')
 TRACKNUM_RE = re.compile(r'(\d+)')
 CUSTOMER_TAIL_ARROW_RE = re.compile(r'→')
+# 正規の号車表記は 【giga05】(giga+2桁) と 【重要運行】のみ。
+# 【GIGA05→06】(号車変更) 【GIGA6】【GIG05】等は自動判定せず Slack通知で警告するだけに留める
+TRACK_CANONICAL_RE = re.compile(r'^(?:giga\d{2}|重要運行)$', re.IGNORECASE)
 DRIVER_LINE_RE = re.compile(
     rf'ドライバー\s*{_PAREN_O}幹線{_PAREN_C}\s*{_COLON}\s*<@(U[A-Z0-9]+)>')
 OPERATOR_LINE_RE = re.compile(
@@ -117,8 +123,8 @@ def fetch_messages(client: WebClient, channel_id: str, limit: int,
 
 def collect_teams_posts(messages: list[dict],
                         target_date: "date | None" = None) -> list[dict]:
-    """Teams URL を含む親メッセージを抽出。target_date 指定時は投稿日 ±14日で粗く絞る
-    (実日付判定は Teams会議側で行う)。"""
+    """Teams URL を含む親メッセージを抽出。target_date 指定時は投稿日 ±POST_WINDOW_DAYS で
+    粗く絞る (実日付判定は Teams会議側で行う)。"""
     results: list[dict] = []
     seen_ts: set[str] = set()
     for msg in messages:
@@ -129,7 +135,7 @@ def collect_teams_posts(messages: list[dict],
         if target_date:
             try:
                 posted = datetime.fromtimestamp(float(ts), tz=JST).date()
-                if abs((posted - target_date).days) > 14:
+                if abs((posted - target_date).days) > POST_WINDOW_DAYS:
                     continue
             except (ValueError, TypeError):
                 continue
@@ -198,6 +204,9 @@ def extract_tracking_metadata(msg: dict, client: WebClient, user_cache: dict,
         nm = TRACKNUM_RE.search(track)
         if nm:
             result["Track-num"] = nm.group(1)
+        if not TRACK_CANONICAL_RE.match(track):
+            result.setdefault("_warn", []).append(
+                f"Slack本文の号車表記が非正規です: 【{track}】 (正規: 【giga05】形式)")
 
     # Customer: 】の後 ～ 末尾の方向(X→Y)・装飾を除いた部分
     m = re.search(r'】([^\n<※]+)', first_line)
@@ -371,10 +380,25 @@ def parse_teams_subject(subject: str) -> dict:
     return result
 
 
+def _track_nums(brackets: str) -> set:
+    """【】内文字列から号車番号を0埋め2桁の集合で返す ('GIGA05→06' → {'05','06'})。"""
+    return {n.zfill(2) for n in TRACKNUM_RE.findall(brackets or "")}
+
+
 def apply_teams_meeting(meta: dict, meeting: dict, debug: bool = False) -> None:
     """Teams会議情報を meta に反映 (Trackname/Track-num/Customer と開始/終了時刻)。
     Route は Slack本文の `自動運転区間：` を優先するため上書きしない。"""
-    tmeta = parse_teams_subject(meeting.get("subject", "") or "")
+    subject = meeting.get("subject", "") or ""
+    tmeta = parse_teams_subject(subject)
+    # 他号車の Teams会議室を流用した投稿だと Trackname が Teams側の号車に上書きされてしまう。
+    # 自動判定はせず、Slack本文と号車が食い違うことだけを警告する (上書き前に比較)
+    s_nums = _track_nums(meta.get("Trackname", ""))
+    t_nums = _track_nums("".join(TRACKNAME_RE.findall(subject)))
+    if s_nums and t_nums and not (s_nums & t_nums):
+        meta.setdefault("_warn", []).append(
+            f"Slack本文と Teams会議件名で号車が不一致です: "
+            f"Slack=【{meta.get('Trackname', '')}】 / Teams件名=\"{subject}\" "
+            f"→ Teams側を採用")
     for k in ("Trackname", "Track-num", "Customer"):
         if tmeta.get(k):
             meta[k] = tmeta[k]
@@ -592,13 +616,17 @@ def resolve_relative_date(value: str | None) -> "date | None":
 
 
 def build_notification(legs_records: list, target_date: "date | None",
-                       legs_new_count: int, legs_skipped_count: int) -> str:
-    """完了通知テキスト (✅ success / ❌ failed / 🔁 skipped) を組み立てる。"""
+                       legs_new_count: int, legs_skipped_count: int,
+                       format_warns: list = ()) -> str:
+    """完了通知テキスト (✅ success / ❌ failed / 🔁 skipped) を組み立てる。
+    legs_skipped_count は URL重複・dedupキー重複の両方を合算した件数。
+    format_warns は号車表記の形式ずれ [(警告文, URL), ...] (自動補正はしない)。"""
     incomplete: set = set()
-    if not legs_records:
-        status = "✅ success: (今回追加されたレコードはありません)"
-    elif legs_new_count == 0 and legs_skipped_count > 0:
+    if legs_new_count == 0 and legs_skipped_count > 0:
+        # URL重複でレコード化前に落ちた分も含むため legs_records は空になり得る
         status = f"🔁 skipped: 全て既存レコードと重複のため追加なし ({legs_skipped_count} 件スキップ)"
+    elif not legs_records:
+        status = "✅ success: (今回追加されたレコードはありません)"
     else:
         for i, rec in enumerate(legs_records):
             ok, _ = is_legs_record_complete(rec)
@@ -634,6 +662,11 @@ def build_notification(legs_records: list, target_date: "date | None",
             lines.append(f'URL: <{meta["url"]}|スレッドを開く>')
     if len(legs_records) > MAX:
         lines += ["", f"…他 {len(legs_records) - MAX} 件"]
+    if format_warns:
+        lines[0] += f" / ⚠️ 号車表記の形式ずれ {len(format_warns)} 件"
+        lines += ["", f"⚠️ 号車表記の形式ずれ ({len(format_warns)} 件) — Trackname を要確認"]
+        for w, u in format_warns:
+            lines.append(f"・{w}" + (f" <{u}|スレッドを開く>" if u else ""))
     return "\n".join(lines)
 
 
@@ -709,10 +742,18 @@ def main() -> None:
     if args.logs_out:
         existing_logs, log_max_date = load_logs_json(args.logs_out)
         if log_max_date:
-            log_ts = datetime.combine(log_max_date, datetime.min.time()).timestamp()
+            # 対象日は投稿日 ±POST_WINDOW_DAYS で拾うので、logs.json 由来の since が
+            # その下限より新しいと対象投稿が取得段階で落ちる (過去日を再実行すると
+            # 通知の明細が減る) 。下限側にクランプして取り逃しを防ぐ
+            since_date = log_max_date
+            if target_date:
+                since_date = min(since_date,
+                                 target_date - timedelta(days=POST_WINDOW_DAYS))
+            log_ts = datetime.combine(since_date, datetime.min.time()).timestamp()
             if since_ts is None or float(since_ts) < log_ts:
                 since_ts = str(log_ts)
-                log(f"[logs] 最新投稿日 {log_max_date} を since に使用 (既存 {len(existing_logs)} 件)")
+                log(f"[logs] since={since_date} を使用 "
+                    f"(logs.json 最新投稿日 {log_max_date} / 既存 {len(existing_logs)} 件)")
 
     # Teams URL を含む親メッセージを収集
     posts: list = []
@@ -749,7 +790,8 @@ def main() -> None:
         drivers = args.track_calendars if isinstance(args.track_calendars, list) \
             else [args.track_calendars]
         log(f"\n=== ドライバー予定表をプリフェッチ ({len(drivers)}人) ===")
-        track_event_map = fetch_track_calendars(drivers, graph_token, target_date, 14)
+        track_event_map = fetch_track_calendars(drivers, graph_token, target_date,
+                                                POST_WINDOW_DAYS)
         log(f"[track-cal] 合計 {len(track_event_map)} 件を JoinUrl で索引化")
 
     user_cache: dict = {}
@@ -777,6 +819,7 @@ def main() -> None:
 
     legs_records: list = []
     url_to_posted_iso: dict = {}
+    format_warns: list = []
     skipped_count = 0
     total = len(posts)
     for idx, f in enumerate(posts, 1):
@@ -811,6 +854,9 @@ def main() -> None:
             if args.append and url and url in existing_urls:
                 skipped_count += 1
                 continue
+            for w in meta.get("_warn", []):
+                log(f"    [警告] {w}")
+                format_warns.append((w, url))
             legs_records.append(build_legs_record(meta, url))
             if url:
                 existing_urls.add(url)
@@ -875,7 +921,8 @@ def main() -> None:
     if args.notify_webhook_url:
         send_slack_notification(
             args.notify_webhook_url,
-            build_notification(legs_records, target_date, legs_new_count, legs_skipped_count))
+            build_notification(legs_records, target_date, legs_new_count,
+                               legs_skipped_count + skipped_count, format_warns))
 
 
 if __name__ == "__main__":
