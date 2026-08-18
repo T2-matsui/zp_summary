@@ -17,8 +17,9 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 7. [新しいドライバーを追加するとき](#新しいドライバーを追加するとき)
 8. [Slack通知を変えるとき](#slack通知を変えるとき)
 9. [logs.json をリセットして再取得したいとき](#logsjson-をリセットして再取得したいとき)
-10. [トラブルシューティング](#トラブルシューティング)
-11. [メンテナンス](#メンテナンス)
+10. [本番へ取り込む (merge_legs.py)](#本番へ取り込む-merge_legspy)
+11. [トラブルシューティング](#トラブルシューティング)
+12. [メンテナンス](#メンテナンス)
 
 ---
 
@@ -55,13 +56,49 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 | ステータス | 条件 |
 |---|---|
 | `✅ success` | 新規レコードを追加 (問題なし)。一部重複した場合は「N 件追加 (重複スキップ M 件)」と併記 |
-| `❌ failed` | 新規追加分に不完全なレコード (未取得項目 / giga番号未確定の「重要運行」) がある |
+| `❌ failed` | **処理中にエラーが発生した** (優先)、または新規追加分に不完全なレコード (未取得項目 / giga番号未確定の「重要運行」) がある |
 | `🔁 skipped` | 今回分が **全て既存と重複** で追加なし。success でも failed でもない中立表示。既存レコードの不完全さは failed 扱いにしない |
 | `✅ success (対象なし)` | 対象日に該当投稿が 0 件 |
 
-いずれのステータスでも `対象日: YYYY-MM-DD` の行が付く。
+いずれのステータスでも `対象日: YYYY-MM-DD` の行が付く。エラーが 1 件でもあれば `✅ success` は出さず、末尾に `❌ エラー (N 件)` の明細が付く。人の確認が必要なだけの事象 (号車表記の補正など) はステータスを変えず `⚠️ 要確認 (N 件)` として列挙される。
 
 重複には **URL一致** (同じスレッドの再取得) と **(Trackname, 日付, 往路/復路) 一致** (同じ運行の別スレッド再投稿) の 2 経路があり、どちらも `🔁 skipped` のスキップ件数に合算される。前者はレコード化前に落ちるため、`🔁 skipped` 通知に運行の明細行が並ばないことがある。
+
+### 失敗したときに Slack へ流れるもの
+
+トラブルに気付けることを優先し、**異常は全て運行チャンネル (`notify_webhook_url`) に流れる**。
+
+| 失敗内容 | 通知 |
+|---|---|
+| 途中で異常終了した (Graph トークン期限切れ、Slack API 障害、想定外の例外) | `❌ failed: zp_summary が異常終了しました` + 例外名・メッセージ・traceback 末尾 |
+| 起動時の設定不備 (`SLACK_TOKEN` 未設定 / config.json 読み込み失敗 / channel 未指定) | 同上 (通知先が分かる前に落ちた場合は `ZP_NOTIFY_WEBHOOK_URL` → `config.json` の生読みで通知先を探す) |
+| `legs.json` / `logs.json` が壊れて読めない | `❌ failed` で**中断**する。空配列で続行して既存レコードを取りこぼしたまま上書きするのを防ぐため |
+| `legs.json` の保存失敗 (ディスクフル・権限など) | `❌ failed` + 「運行記録 N 件が未保存」。**保存できていないのに `✅ success` は出ない** |
+| `logs.json` の保存失敗 | `❌ failed` + 「次回実行の取得範囲がずれます」 |
+| 投稿単位の処理失敗 | `❌ failed` + どの投稿で何の例外が出たか (他の投稿の処理は続行する) |
+| チャンネルの解決失敗 / チャンネル単位の Slack API エラー | `❌ failed` + 対象チャンネル名 |
+| 対象投稿が 0 件 | `✅ success (対象なし)` を必ず通知する。「本当に 0 件」と「取得に失敗して 0 件」を Slack 上で区別できるようにするため |
+| 号車表記の補正・非正規表記・2台併記の取りこぼし | `⚠️ 要確認` (ステータスは変えない) |
+| タイトル行の日付が読めずスキップした投稿 | `⚠️ 要確認` (日付は `8月12日` 形式のみ解釈できる。`8/12` は読めない) |
+
+エラーがあった場合はプロセスも**非ゼロ終了**するため、systemd の `OnFailure=` でも検知できる ([systemd ユニット作成](#9-systemd-ユニット作成) 参照)。
+
+通知経路そのものが落ちている場合 (webhook URL 未設定・Slack 側障害) は Slack へ出せないため、ログに `[警告] 通知先 webhook が未設定` / `[警告] Slack通知失敗` が残る。**通知が来ない日が続いたら、まず journalctl を確認する。**
+
+### 号車表記 (Trackname) の扱い
+
+正規の表記は `【giga05】` (半角小文字 giga + 2桁) と `【重要運行】` のみ。
+
+| 入力 | 出力 | 通知 |
+|---|---|---|
+| `【giga05】` | `giga05` | なし |
+| `【GIGA05】` `【Giga05】` `【ｇｉｇａ０５】` `【giga5】` | `giga05` に**正規化** | `⚠️ 要確認` に「補正しました」 |
+| `【GIGA05→06】` `【giga100】` | 補正せずそのまま | `⚠️ 要確認` に「自動補正できません」 |
+| `【giga05】【giga06】` (2台併記) | 先頭の `giga05` のみ | `⚠️ 要確認` に「取りこぼしています」 |
+
+正規化は **Slack本文と Teams会議件名の両方**に掛かる。重複判定キー (`legs_dedup_key`) も正規化後の値で比較するため、`GIGA05` と `giga05` は同一運行として扱われ二重登録されない (`merge_legs.py` 側も同一ロジック。**片方だけ変更しないこと**)。
+
+Slack本文が `【重要運行】` で Teams会議件名に号車がある場合は、Teams 側の号車が採用される (これは正常フロー)。**他号車の会議室を流用して投稿された場合は誤った号車が確定するが、判別する材料がないため検知できない。**
 
 ### 認証
 
@@ -119,6 +156,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 ```
 ~/Downloads/zp_summary/      ← 運用ディレクトリ
 ├── slack_attachment_reader.py   ← メインスクリプト
+├── merge_legs.py                ← 生成物を本番 legs.json へマージ (手動実行)
 ├── calendar_probe.py            ← 動作確認用
 ├── run_zp_summary.sh            ← systemd から呼ばれる起動スクリプト
 ├── config.json                  ← 設定 (秘密、git除外)
@@ -233,11 +271,35 @@ nano ~/.config/systemd/user/zp-summary.service
 ```ini
 [Unit]
 Description=Run zp_summary slack attachment reader
+OnFailure=zp-summary-failure.service
 
 [Service]
 Type=oneshot
 ExecStart=%h/Downloads/zp_summary/run_zp_summary.sh
 ```
+
+#### 失敗通知ユニット (OnFailure)
+
+スクリプト自体が起動しない・OOM kill された等、**本体が Slack 通知を出せずに落ちた場合の最後の砦**。
+`ZP_NOTIFY_WEBHOOK_URL` に運行チャンネルの webhook URL を入れておく。
+
+```bash
+nano ~/.config/systemd/user/zp-summary-failure.service
+```
+
+```ini
+[Unit]
+Description=Notify Slack when zp-summary.service fails
+
+[Service]
+Type=oneshot
+Environment=ZP_NOTIFY_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
+ExecStart=/bin/bash -c 'curl -sS -X POST -H "Content-type: application/json" \
+  --data "{\"text\":\"❌ failed: zp-summary.service が異常終了しました (systemd 検知)\\njournalctl --user -u zp-summary.service -n 50 で確認してください\"}" \
+  "$ZP_NOTIFY_WEBHOOK_URL"'
+```
+
+本体がエラーを検知した場合はプロセスが非ゼロ終了するので、この経路でも通知が飛ぶ (Slack 側では本体の `❌ failed` と 2 通並ぶ)。
 
 #### timer ファイル
 
@@ -549,6 +611,75 @@ cp ~/Downloads/zp_summary/legs.json ~/Downloads/zp_summary/legs.json.bak
 rm ~/Downloads/zp_summary/legs.json ~/Downloads/zp_summary/logs.json
 systemctl --user start zp-summary.service
 ```
+
+---
+
+## 本番へ取り込む (merge_legs.py)
+
+`merge_legs.py` は zp_summary の生成物を本番 `legs.json` へマージする。**手動実行**であり、`run_zp_summary.sh` からは呼ばれない。
+
+### 設計 (安全側)
+
+- **追記のみ。** 既存レコードは変更・削除せず、順序も保持する
+- 追加するのは dedup キー `(Trackname, 日付, 往路/復路)` が既存に無いものだけ (Trackname は正規化して比較)
+- 書き込み前に**世代バックアップ** → アトミック書き込み (tmp + `os.replace`) → 書き込み後に読み直して検証 → 異常なら**自動ロールバック**
+- 出力は「1 行 1 レコード」形式。`legs_tools/legs_server.py` の行ベースパーサ互換を書き込み前に検証する
+
+以下のいずれかに該当したら**本番を書き換えずに中断**し、Slack へ `❌ legs.json マージ中断` を通知する。
+
+1. 本番ファイルがパースできない / 空 / 配列でない
+2. 生成物がパースできない / 空 / 配列でない
+3. 出力件数が既存件数を下回る
+4. 既存レコードの内容が 1 件でも変化している
+5. 追加件数が `--max-add` (既定 50) を超える (暴走検知)
+6. 出力が `legs_server.py` のパーサと非互換
+
+バックアップ作成失敗・書き込みの I/O エラー等の想定外の例外も `❌ legs.json マージが異常終了しました` として Slack へ流れる。
+
+### 手順
+
+```bash
+export MERGE_LEGS_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
+
+# 1. 何が追加されるか確認 (本番は書き換えない)
+python3 merge_legs.py --dry-run
+
+# 2. 問題なければ実行
+python3 merge_legs.py
+```
+
+既定のパスは以下。変える場合は `--target` `--source` `--backup-dir` で指定する。
+
+| 対象 | 既定パス |
+|---|---|
+| 本番 legs.json | `/mnt/disks/dropoff/global_data/legs.json` |
+| 生成物 | `/mnt/disks/dropoff/zp_summary/legs_generated.json` |
+| バックアップ | `/mnt/disks/dropoff/backups/global_data/` (30 世代) |
+
+### リバート手順
+
+書き込み後の検証に失敗した場合は**自動でロールバックされる** (Slack に `❌ legs.json マージ失敗・ロールバック済み` が飛ぶ)。取り込んだ内容自体を後から戻したいときは、世代バックアップから復元する。
+
+```bash
+# 1. バックアップ世代を確認 (ファイル名の末尾がマージ実行時刻)
+ls -lt /mnt/disks/dropoff/backups/global_data/
+
+# 2. 戻す前に現状を退避 (このスクリプトは *.safe を削除しない)
+cp /mnt/disks/dropoff/global_data/legs.json \
+   /mnt/disks/dropoff/backups/global_data/legs.json.before-revert.safe
+
+# 3. 復元
+cp /mnt/disks/dropoff/backups/global_data/legs.json.20260812-120000 \
+   /mnt/disks/dropoff/global_data/legs.json
+
+# 4. 件数とパース互換を確認
+python3 -c "import json;print(len(json.load(open('/mnt/disks/dropoff/global_data/legs.json'))))"
+python3 merge_legs.py --dry-run
+```
+
+`--keep-backups` の世代管理は `<ファイル名>.YYYYMMDD-HHMMSS` 形式のみを対象にするため、手動で退避した `*.safe` は自動削除されない。
+
+本番を 1 行 1 レコード形式に整形し直すだけなら `--normalize-only` を使う (マージはしない)。
 
 ---
 

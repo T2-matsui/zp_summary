@@ -13,6 +13,8 @@ import json
 import os
 import re
 import sys
+import traceback
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -43,9 +45,12 @@ TRACKING_DATE_TITLE_RE = re.compile(r'(\d{1,2})月(\d{1,2})日')
 TRACKNAME_RE = re.compile(r'【([^】]+)】')
 TRACKNUM_RE = re.compile(r'(\d+)')
 CUSTOMER_TAIL_ARROW_RE = re.compile(r'→')
-# 正規の号車表記は 【giga05】(giga+2桁) と 【重要運行】のみ。
-# 【GIGA05→06】(号車変更) 【GIGA6】【GIG05】等は自動判定せず Slack通知で警告するだけに留める
-TRACK_CANONICAL_RE = re.compile(r'^(?:giga\d{2}|重要運行)$', re.IGNORECASE)
+# 正規の号車表記は 【giga05】(半角小文字 giga + 2桁) と 【重要運行】のみ。
+# 大文字・全角・桁不足 (GIGA05 / ｇｉｇａ０５ / giga5) は giga05 に正規化した上で通知に報告する。
+# 【GIGA05→06】(号車変更) のように号車が一意に定まらない表記は補正せず警告だけに留める。
+TRACK_CANONICAL_RE = re.compile(r'^(?:giga\d{2}|重要運行)$')
+# 正規化できる号車表記 (NFKC 後に giga+1〜2桁とみなせるもの)
+GIGA_NORMALIZABLE_RE = re.compile(r'^giga\s*(\d{1,2})$', re.IGNORECASE)
 DRIVER_LINE_RE = re.compile(
     rf'ドライバー\s*{_PAREN_O}幹線{_PAREN_C}\s*{_COLON}\s*<@(U[A-Z0-9]+)>')
 OPERATOR_LINE_RE = re.compile(
@@ -186,6 +191,40 @@ def normalize_slack_text(text: str) -> str:
     return text
 
 
+def normalize_trackname(track: str) -> str:
+    """号車表記を正規形 (半角小文字 giga + 2桁) に揃える。
+
+    'GIGA05' 'ｇｉｇａ０５' 'giga5' → 'giga05' / '重要運行' → '重要運行'
+    'giga05→06' のように号車が一意に定まらない表記は NFKC 正規化だけして返す。
+    出力 (build_legs_record) と重複判定 (legs_dedup_key) の両方がここを通るので、
+    表記ゆれが別レコードとして二重登録されない。merge_legs.py 側にも同じ関数がある。
+    """
+    s = unicodedata.normalize("NFKC", track or "").strip()
+    m = GIGA_NORMALIZABLE_RE.match(s)
+    return f"giga{m.group(1).zfill(2)}" if m else s
+
+
+def set_trackname(meta: dict, raw: str, source: str) -> None:
+    """号車表記を正規化して meta に格納し、正規形と違っていれば警告を積む。
+
+    Slack本文と Teams会議件名の両方がここを通る (Teams件名由来の表記も検証される)。
+    """
+    track = (raw or "").strip()
+    if not track:
+        return
+    norm = normalize_trackname(track)
+    meta["Trackname"] = norm
+    nm = TRACKNUM_RE.search(norm)
+    if nm:
+        meta["Track-num"] = nm.group(1)
+    if not TRACK_CANONICAL_RE.match(norm):
+        meta.setdefault("_warn", []).append(
+            f"{source}の号車表記が非正規で自動補正できません: 【{track}】 (正規: 【giga05】形式)")
+    elif norm != track:
+        meta.setdefault("_warn", []).append(
+            f"{source}の号車表記を補正しました: 【{track}】 → 【{norm}】")
+
+
 def extract_tracking_metadata(msg: dict, client: WebClient, user_cache: dict,
                               default_year: int) -> dict:
     """親メッセージ本文から tracking フィールドを抽出 (返信なら _parent_msg を見る)。"""
@@ -196,17 +235,19 @@ def extract_tracking_metadata(msg: dict, client: WebClient, user_cache: dict,
     # タイトル行 = 【...】を含む最初の行
     first_line = next((ln for ln in text.split("\n") if "【" in ln and "】" in ln),
                       text.split("\n", 1)[0])
+    result["_title_line"] = first_line.strip()
 
-    m = TRACKNAME_RE.search(first_line)
-    if m:
-        track = m.group(1).strip()
-        result["Trackname"] = track
-        nm = TRACKNUM_RE.search(track)
-        if nm:
-            result["Track-num"] = nm.group(1)
-        if not TRACK_CANONICAL_RE.match(track):
+    brackets = TRACKNAME_RE.findall(first_line)
+    if brackets:
+        set_trackname(result, brackets[0], "Slack本文")
+        # 【giga05】【giga06】のような2台併記は先頭しか取り込めないため取りこぼしを警告する
+        # (【重要】等の号車番号を含まない併記は対象外)
+        others = [b.strip() for b in brackets[1:]
+                  if _track_nums(b) - _track_nums(brackets[0])]
+        if others:
             result.setdefault("_warn", []).append(
-                f"Slack本文の号車表記が非正規です: 【{track}】 (正規: 【giga05】形式)")
+                f"Slack本文に号車が複数あります: 【{brackets[0].strip()}】 のみ取り込み、"
+                + "".join(f"【{o}】" for o in others) + " は取りこぼしています")
 
     # Customer: 】の後 ～ 末尾の方向(X→Y)・装飾を除いた部分
     m = re.search(r'】([^\n<※]+)', first_line)
@@ -399,9 +440,13 @@ def apply_teams_meeting(meta: dict, meeting: dict, debug: bool = False) -> None:
             f"Slack本文と Teams会議件名で号車が不一致です: "
             f"Slack=【{meta.get('Trackname', '')}】 / Teams件名=\"{subject}\" "
             f"→ Teams側を採用")
-    for k in ("Trackname", "Track-num", "Customer"):
-        if tmeta.get(k):
-            meta[k] = tmeta[k]
+    if tmeta.get("Trackname"):
+        # Teams件名由来の表記も正規化・検証する (Track-num も併せて更新される)
+        set_trackname(meta, tmeta["Trackname"], "Teams会議件名")
+    elif tmeta.get("Track-num"):
+        meta["Track-num"] = tmeta["Track-num"]
+    if tmeta.get("Customer"):
+        meta["Customer"] = tmeta["Customer"]
     start_str, end_str = meeting.get("startDateTime", ""), meeting.get("endDateTime", "")
     if not (start_str and end_str):
         if debug:
@@ -447,13 +492,14 @@ def build_legs_record(meta: dict, url: str) -> list:
             return v
         return re.sub(r"^\s*【\s*giga\d+\s*】\s*", "", v, flags=re.IGNORECASE)
 
-    track = _giga(track)
+    track = normalize_trackname(track)
     # 「重要運行」は loaded_luggage の【gigaXX】から番号を拾って Trackname=gigaXX 等に補正
     if track == "重要運行":
-        m = re.search(r"giga(\d+)", _giga(meta.get("Customer", "")), re.IGNORECASE)
+        customer = unicodedata.normalize("NFKC", meta.get("Customer", "") or "")
+        m = re.search(r"giga\s*(\d{1,2})", customer, re.IGNORECASE)
         if m:
-            track = f"giga{m.group(1)}"
-            track_num = m.group(1)
+            track = normalize_trackname(f"giga{m.group(1)}")
+            track_num = m.group(1).zfill(2)
             if date_str:
                 date_str = f"{date_str}_重要運行"
 
@@ -503,7 +549,12 @@ def is_legs_record_complete(rec) -> tuple[bool, list]:
 
 
 def legs_dedup_key(rec) -> tuple:
-    """重複判定キー (Trackname, 日付, 往路/復路)。配列/dict 両形式に対応。"""
+    """重複判定キー (Trackname, 日付, 往路/復路)。配列/dict 両形式に対応。
+
+    Trackname は normalize_trackname で正規化して比較するため、既存レコードが
+    'GIGA05' 'Giga05' のような表記ゆれでも同一運行として重複判定される。
+    merge_legs.legs_dedup_key と同一ロジック。変更する場合は両方を揃えること。
+    """
     if isinstance(rec, list) and len(rec) >= 4:
         track = rec[0] or ""
         date_part = rec[1] or ""
@@ -517,13 +568,21 @@ def legs_dedup_key(rec) -> tuple:
         return ("", "", "")
     date_str = date_part.split("|", 1)[1] if "|" in date_part else ""
     direction = next((w for w in ("往路", "復路") if w in liggage), "")
-    return (track, date_str, direction)
+    return (normalize_trackname(track), date_str, direction)
 
 
 # ---------- I/O ----------
 
+class DataFileError(RuntimeError):
+    """既存データファイルが壊れていて安全に続行できない (Slack へ通知して中断する)。"""
+
+
 def read_json_list(path: str) -> list:
-    """BOM対応でJSON配列を読む。存在しない/壊れている場合は []。"""
+    """BOM対応でJSON配列を読む。存在しない/空の場合は []。
+
+    壊れている場合は [] を返して続行せず DataFileError で中断する。空配列で続行すると
+    既存レコードを取りこぼしたまま legs.json を上書きしてしまうため。
+    """
     if not os.path.exists(path):
         return []
     try:
@@ -541,10 +600,14 @@ def read_json_list(path: str) -> list:
         if not content:
             return []
         data = json.loads(content)
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        log(f"[警告] JSON読み込み失敗 ({path}): {e}")
-        return []
+    except OSError as e:
+        raise DataFileError(f"{path} を読み込めません: {e}") from e
+    except json.JSONDecodeError as e:
+        raise DataFileError(f"{path} が JSON として壊れています: {e}") from e
+    if not isinstance(data, list):
+        raise DataFileError(
+            f"{path} が JSON 配列ではありません (type={type(data).__name__})")
+    return data
 
 
 def load_logs_json(path: str) -> tuple[list, "date | None"]:
@@ -583,6 +646,10 @@ def atomic_write_json(path: str, data) -> None:
 
 
 def send_slack_notification(webhook_url: str, text: str) -> None:
+    if not webhook_url:
+        # 通知先未設定を黙って無視すると「通知が来ない」ことに気付けないため必ず残す
+        log("[警告] 通知先 webhook が未設定のため Slack 通知を送れませんでした")
+        return
     try:
         r = requests.post(webhook_url, json={"text": text}, timeout=15)
         if not r.ok:
@@ -617,29 +684,33 @@ def resolve_relative_date(value: str | None) -> "date | None":
 
 def build_notification(legs_records: list, target_date: "date | None",
                        legs_new_count: int, legs_skipped_count: int,
-                       format_warns: list = ()) -> str:
+                       format_warns: list = (), errors: list = ()) -> str:
     """完了通知テキスト (✅ success / ❌ failed / 🔁 skipped) を組み立てる。
     legs_skipped_count は URL重複・dedupキー重複の両方を合算した件数。
-    format_warns は号車表記の形式ずれ [(警告文, URL), ...] (自動補正はしない)。"""
+    format_warns は人が確認すべき事象 [(警告文, URL), ...] (号車表記の補正・非正規表記・
+    日付が読めずスキップした投稿など)。ステータスは変えず ⚠️ 要確認として列挙する。
+    errors は処理中に発生した異常の一覧。1 件でもあれば ✅ success は出さない。"""
     incomplete: set = set()
-    if legs_new_count == 0 and legs_skipped_count > 0:
+    for i, rec in enumerate(legs_records):
+        ok, _ = is_legs_record_complete(rec)
+        track = rec[0] if isinstance(rec, list) and rec else ""
+        if not ok or track == "重要運行":  # giga番号未確定も failed 扱い
+            incomplete.add(i)
+
+    if errors:
+        status = f"❌ failed: 処理中にエラーが発生しました ({len(errors)} 件)"
+    elif legs_new_count == 0 and legs_skipped_count > 0:
         # URL重複でレコード化前に落ちた分も含むため legs_records は空になり得る
         status = f"🔁 skipped: 全て既存レコードと重複のため追加なし ({legs_skipped_count} 件スキップ)"
+    elif incomplete:
+        status = (f"❌ failed: 運行記録に不完全なレコードがあります "
+                  f"({len(incomplete)}/{len(legs_records)} 件)")
     elif not legs_records:
         status = "✅ success: (今回追加されたレコードはありません)"
+    elif legs_skipped_count > 0:
+        status = f"✅ success: {legs_new_count} 件追加 (重複スキップ {legs_skipped_count} 件)"
     else:
-        for i, rec in enumerate(legs_records):
-            ok, _ = is_legs_record_complete(rec)
-            track = rec[0] if isinstance(rec, list) and rec else ""
-            if not ok or track == "重要運行":  # giga番号未確定も failed 扱い
-                incomplete.add(i)
-        if incomplete:
-            status = (f"❌ failed: 運行記録に不完全なレコードがあります "
-                      f"({len(incomplete)}/{len(legs_records)} 件)")
-        elif legs_skipped_count > 0:
-            status = f"✅ success: {legs_new_count} 件追加 (重複スキップ {legs_skipped_count} 件)"
-        else:
-            status = "✅ success: 運行記録の読み込みが完了しました"
+        status = "✅ success: 運行記録の読み込みが完了しました"
 
     lines = [status]
     if target_date:
@@ -662,11 +733,31 @@ def build_notification(legs_records: list, target_date: "date | None",
             lines.append(f'URL: <{meta["url"]}|スレッドを開く>')
     if len(legs_records) > MAX:
         lines += ["", f"…他 {len(legs_records) - MAX} 件"]
-    if format_warns:
-        lines[0] += f" / ⚠️ 号車表記の形式ずれ {len(format_warns)} 件"
-        lines += ["", f"⚠️ 号車表記の形式ずれ ({len(format_warns)} 件) — Trackname を要確認"]
-        for w, u in format_warns:
+    warns = list(dict.fromkeys(tuple(w) for w in format_warns))  # 同一警告の重複を除く
+    if warns:
+        lines[0] += f" / ⚠️ 要確認 {len(warns)} 件"
+        lines += ["", f"⚠️ 要確認 ({len(warns)} 件)"]
+        for w, u in warns:
             lines.append(f"・{w}" + (f" <{u}|スレッドを開く>" if u else ""))
+    if errors:
+        lines += ["", f"❌ エラー ({len(errors)} 件)"]
+        for e in list(errors)[:MAX]:
+            lines.append(f"・{e}")
+        if len(errors) > MAX:
+            lines.append(f"…他 {len(errors) - MAX} 件")
+    return "\n".join(lines)
+
+
+def build_crash_notification(exc: BaseException, target_date: "date | None") -> str:
+    """異常終了時の通知テキスト。完了通知が出せないまま落ちた場合に使う。"""
+    tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tail = "".join(tb[-3:]).strip()
+    lines = ["❌ failed: zp_summary が異常終了しました "
+             "(運行記録が更新されていない可能性があります)"]
+    if target_date:
+        lines.append(f"対象日: {target_date.isoformat()}")
+    lines += [f"実行終了: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+              "", f"{type(exc).__name__}: {exc}", "", "```", tail[:1500], "```"]
     return "\n".join(lines)
 
 
@@ -714,8 +805,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace, state: dict) -> int:
+    """本体。戻り値は errors の件数 (0 以外なら main() が非ゼロ終了する)。
+
+    state は異常終了時の通知に使う情報 (対象日) を main() へ渡すための箱。
+    errors に積んだ異常は完了通知で ❌ failed として報告する。1 件でも積まれたら
+    ✅ success は出さない (保存に失敗しているのに成功通知が飛ぶのを防ぐ)。
+    """
+    errors: list = []
     if not args.channel:
         sys.exit("エラー: --channel もしくは config.json の \"channel\" 指定が必要です")
     channels = [c for c in (args.channel if isinstance(args.channel, list)
@@ -727,6 +824,7 @@ def main() -> None:
 
     since_ts = parse_since(args.since) if args.since else None
     target_date = resolve_relative_date(args.content_date)
+    state["target_date"] = target_date
     if target_date:
         log(f"[情報] content_date = {target_date.isoformat()}")
 
@@ -762,12 +860,15 @@ def main() -> None:
             ch_id = resolve_channel_id(client, ch_spec)
         except SystemExit as e:
             log(f"[警告] チャンネル '{ch_spec}' をスキップ: {e}")
+            errors.append(f"チャンネル '{ch_spec}' を解決できずスキップしました: {e}")
             continue
         log(f"\n=== チャンネル {ch_spec} ({ch_id}) を処理 ===")
         try:
             messages = fetch_messages(client, ch_id, args.limit, since_ts)
         except SlackApiError as e:
             log(f"[警告] {ch_spec}: Slack API error: {e.response['error']}")
+            errors.append(f"チャンネル '{ch_spec}' のメッセージ取得に失敗しました: "
+                          f"Slack API error: {e.response['error']}")
             continue
         ch_posts = collect_teams_posts(messages, target_date=target_date)
         for post in ch_posts:
@@ -776,8 +877,13 @@ def main() -> None:
         posts.extend(ch_posts)
 
     if not posts:
+        # 「本当に0件」と「取得に失敗して0件」を Slack 上で区別できるよう必ず通知する
         log("Teams URL を含む投稿が見つかりませんでした。")
-        return
+        if args.notify_webhook_url:
+            send_slack_notification(
+                args.notify_webhook_url,
+                build_notification([], target_date, 0, 0, [], errors))
+        return len(errors)
     log(f"\n合計 {len(posts)} 件のTeams投稿を処理します...")
 
     extra_scopes = ["OnlineMeetings.Read", "Calendars.Read"]
@@ -845,7 +951,14 @@ def main() -> None:
                 log("    [teams診断] Teams URL なし")
 
             if target_date is not None and meta.get("_title_date") != target_date:
-                if args.debug:
+                if meta.get("_title_date") is None:
+                    # 日付が読めない投稿は対象日と必ず不一致になり丸ごと落ちる。無言で
+                    # 消えると気付けないので ⚠️ 要確認として通知に載せる
+                    log("    [警告] タイトル行から日付を読めずスキップ")
+                    format_warns.append((
+                        f"タイトル行の日付を読めずスキップしました "
+                        f"(「8月12日」形式のみ対応): {meta.get('_title_line', '')[:60]}", ""))
+                elif args.debug:
                     log(f"    [filter] 日付不一致でスキップ: {meta.get('_title_date')} != {target_date}")
                 continue
 
@@ -863,8 +976,13 @@ def main() -> None:
                 if posted_iso:
                     url_to_posted_iso[url] = posted_iso
         except Exception as e:
+            # 投稿単位の失敗は他の投稿の処理を止めないが、無言で件数が減らないよう
+            # 必ずログと通知に残す
+            log(f"    [エラー] {type(e).__name__}: {e}")
             if args.debug:
-                log(f"[debug] エラー ({f.get('name')}): {type(e).__name__}: {e}")
+                log(traceback.format_exc())
+            errors.append(f"投稿の処理に失敗しました ({f.get('name', '?')[:40]}): "
+                          f"{type(e).__name__}: {e}")
             continue
 
     # dedup してマージ
@@ -894,7 +1012,10 @@ def main() -> None:
             log(f"[legs] {args.legs_out} に保存 (新規 {legs_new_count} / 重複スキップ "
                 f"{legs_skipped_count} / 累計 {len(final_legs)} 件)")
         except Exception as e:
-            log(f"[警告] legs.json 出力エラー: {e}")
+            # 保存できていないのに ✅ success が飛ばないよう errors に積む
+            log(f"[エラー] legs.json 出力エラー: {e}")
+            errors.append(f"{args.legs_out} の保存に失敗しました "
+                          f"(運行記録 {legs_new_count} 件が未保存): {type(e).__name__}: {e}")
 
     # logs.json: 今回処理した投稿の投稿日履歴を追記
     if args.logs_out:
@@ -916,13 +1037,70 @@ def main() -> None:
             atomic_write_json(args.logs_out, final_logs)
             log(f"[logs] {args.logs_out} に保存 (新規 {len(new_entries)} / 累計 {len(final_logs)} 件)")
         except Exception as e:
-            log(f"[警告] logs.json 出力エラー: {e}")
+            # 保存できないと次回の since がずれて取得漏れになるため errors に積む
+            log(f"[エラー] logs.json 出力エラー: {e}")
+            errors.append(f"{args.logs_out} の保存に失敗しました "
+                          f"(次回実行の取得範囲がずれます): {type(e).__name__}: {e}")
 
     if args.notify_webhook_url:
         send_slack_notification(
             args.notify_webhook_url,
             build_notification(legs_records, target_date, legs_new_count,
-                               legs_skipped_count + skipped_count, format_warns))
+                               legs_skipped_count + skipped_count, format_warns, errors))
+    return len(errors)
+
+
+def fallback_notify_webhook() -> str:
+    """parse_args が失敗しても通知先を得るための最終手段。
+
+    環境変数 ZP_NOTIFY_WEBHOOK_URL → config.json の生読み の順に探す。
+    """
+    url = os.environ.get("ZP_NOTIFY_WEBHOOK_URL", "")
+    if url:
+        return url
+    path = "config.json"
+    if "--config" in sys.argv:
+        i = sys.argv.index("--config")
+        if i + 1 < len(sys.argv):
+            path = sys.argv[i + 1]
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("notify_webhook_url", "") or ""
+    except Exception:
+        return ""
+
+
+def main() -> None:
+    """引数解析 → run()。どこで落ちても Slack に ❌ failed を通知して非ゼロ終了する。
+
+    通知先が分かる前 (config.json の読み込み失敗など) に落ちた場合は
+    fallback_notify_webhook() で通知先を探す。
+    """
+    webhook, state, error_count = "", {}, 0
+    try:
+        args = parse_args()
+        webhook = args.notify_webhook_url or ""
+        error_count = run(args, state)
+    except KeyboardInterrupt:
+        raise
+    except SystemExit as e:
+        if not e.code:  # 正常終了 (exit 0 / exit None)
+            raise
+        _notify_crash(e, state, webhook)
+        sys.exit(1)
+    except Exception as e:
+        _notify_crash(e, state, webhook)
+        sys.exit(2)
+    if error_count:
+        # 完了通知で ❌ failed を報告済みなので、ここでは終了コードだけ立てる
+        log(f"[終了] エラー {error_count} 件")
+        sys.exit(1)
+
+
+def _notify_crash(exc: BaseException, state: dict, webhook: str) -> None:
+    text = build_crash_notification(exc, state.get("target_date"))
+    log(text)
+    send_slack_notification(webhook or fallback_notify_webhook(), text)
 
 
 if __name__ == "__main__":

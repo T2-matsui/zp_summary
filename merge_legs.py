@@ -25,6 +25,8 @@ import os
 import re
 import shutil
 import sys
+import traceback
+import unicodedata
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -42,9 +44,25 @@ def log(msg: str) -> None:
 
 # ---------- legs 形式 ----------
 
+GIGA_NORMALIZABLE_RE = re.compile(r'^giga\s*(\d{1,2})$', re.IGNORECASE)
+
+
+def normalize_trackname(track: str) -> str:
+    """号車表記を正規形 (半角小文字 giga + 2桁) に揃える。
+
+    'GIGA05' 'ｇｉｇａ０５' 'giga5' → 'giga05' / '重要運行' → '重要運行'
+    slack_attachment_reader.normalize_trackname と同一ロジック。両方を揃えること。
+    """
+    s = unicodedata.normalize("NFKC", track or "").strip()
+    m = GIGA_NORMALIZABLE_RE.match(s)
+    return f"giga{m.group(1).zfill(2)}" if m else s
+
+
 def legs_dedup_key(rec) -> tuple:
     """重複判定キー (Trackname, 日付, 往路/復路)。
 
+    Trackname は正規化して比較するため、本番の既存レコードが 'GIGA05' のような
+    表記ゆれでも同一運行として重複判定され、二重登録されない。
     slack_attachment_reader.legs_dedup_key と同一ロジック。変更する場合は両方を揃えること。
     """
     if isinstance(rec, list) and len(rec) >= 4:
@@ -60,7 +78,7 @@ def legs_dedup_key(rec) -> tuple:
         return ("", "", "")
     date_str = date_part.split("|", 1)[1] if "|" in date_part else ""
     direction = next((w for w in ("往路", "復路") if w in luggage), "")
-    return (track, date_str, direction)
+    return (normalize_trackname(track), date_str, direction)
 
 
 def dumps_legs(records: list) -> str:
@@ -155,6 +173,9 @@ def prune_backups(backup_dir: str, target: str, keep: int) -> None:
 
 def notify(webhook_url: str, text: str) -> None:
     if not webhook_url:
+        # 未設定を黙って無視すると「通知が来ない」ことに気付けないため必ずログに残す
+        log("[警告] 通知先 webhook が未設定です "
+            "(--webhook-url もしくは MERGE_LEGS_WEBHOOK_URL を設定してください)")
         return
     try:
         req = urllib.request.Request(
@@ -311,9 +332,28 @@ def main() -> int:
     return 0
 
 
+def _fallback_webhook() -> str:
+    """引数解析前に落ちても通知先を得るための最終手段 (環境変数 → sys.argv)。"""
+    url = os.environ.get("MERGE_LEGS_WEBHOOK_URL", "")
+    if url:
+        return url
+    if "--webhook-url" in sys.argv:
+        i = sys.argv.index("--webhook-url")
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return ""
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:  # 想定外は必ず非ゼロで落とす
+        # バックアップ作成失敗・書き込みの I/O エラー等はここに来る。一番気付きたい
+        # 障害なので、ログだけで終わらせず必ず Slack へ流す
+        tail = "".join(traceback.format_exc().splitlines(keepends=True)[-3:]).strip()
         log(f"[異常終了] {type(e).__name__}: {e}")
+        log(tail)
+        notify(_fallback_webhook(),
+               f"❌ legs.json マージが異常終了しました: {type(e).__name__}: {e}\n"
+               f"```\n{tail[:1500]}\n```")
         sys.exit(2)
