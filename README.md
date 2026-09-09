@@ -15,11 +15,12 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 5. [時間変更手順](#時間変更手順)
 6. [新しいチャンネルを追加するとき](#新しいチャンネルを追加するとき)
 7. [新しいドライバーを追加するとき](#新しいドライバーを追加するとき)
-8. [Slack通知を変えるとき](#slack通知を変えるとき)
-9. [logs.json をリセットして再取得したいとき](#logsjson-をリセットして再取得したいとき)
-10. [本番へ取り込む (merge_legs.py)](#本番へ取り込む-merge_legspy)
-11. [トラブルシューティング](#トラブルシューティング)
-12. [メンテナンス](#メンテナンス)
+8. [取り込む号車を変えるとき](#取り込む号車を変えるとき)
+9. [Slack通知を変えるとき](#slack通知を変えるとき)
+10. [logs.json をリセットして再取得したいとき](#logsjson-をリセットして再取得したいとき)
+11. [本番へ取り込む (merge_legs.py)](#本番へ取り込む-merge_legspy)
+12. [トラブルシューティング](#トラブルシューティング)
+13. [メンテナンス](#メンテナンス)
 
 ---
 
@@ -41,8 +42,10 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 6. ドライバーの共有予定表をプリフェッチ (JoinUrl Map 構築)
    ↓
 7. 各投稿について:
-   - Teams 会議URL → 開始/終了時刻を取得
    - Slack本文 → Driver / SW-ver / 区間 / 顧客 を抽出
+   - track_filter 指定時: Slack本文の号車が対象外ならここで除外 (会議を引かない)
+   - Teams 会議URL → 開始/終了時刻を取得
+   - track_filter 指定時: 会議件名で確定した号車が対象外ならここでも除外
    ↓
 8. 出力:
    - legs.json: 配列フォーマット (重複スキップ)
@@ -58,6 +61,8 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 | `✅ success` | 新規レコードを追加 (問題なし)。一部重複した場合は「N 件追加 (重複スキップ M 件)」と併記 |
 | `❌ failed` | **処理中にエラーが発生した** (優先)、または新規追加分に不完全なレコード (未取得項目 / giga番号未確定の「重要運行」) がある |
 | `🔁 skipped` | 今回分が **全て既存と重複** で追加なし。success でも failed でもない中立表示。既存レコードの不完全さは failed 扱いにしない |
+
+`notify_mentions` を設定すると、**`❌ failed` のときだけ**通知の先頭にメンションが付く (`✅ success` / `🔁 skipped` には付かない)。異常終了して完了通知が出せなかった場合の通知にも付く。
 | `✅ success (対象なし)` | 対象日に該当投稿が 0 件 |
 
 いずれのステータスでも `対象日: YYYY-MM-DD` の行が付く。エラーが 1 件でもあれば `✅ success` は出さず、末尾に `❌ エラー (N 件)` の明細が付く。人の確認が必要なだけの事象 (号車表記の補正など) はステータスを変えず `⚠️ 要確認 (N 件)` として列挙される。
@@ -96,7 +101,6 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 | `【giga05→06】` `【GIGA05→06】` (号車変更) | **変更後 (最後) の号車** `giga06` を採用 | `⚠️ 要確認` に「号車変更表記から変更後の号車を採用しました」 |
 | `【giga100】` `【giga05-06】` `【giga05〜06】` | 補正せずそのまま | `⚠️ 要確認` に「自動補正できません」 |
 | `【giga05】【giga06】` (2台併記) | 先頭の `giga05` のみ | `⚠️ 要確認` に「取りこぼしています」 |
-| `【giga05】【giga06】` (2台併記) | 先頭の `giga05` のみ | `⚠️ 要確認` に「取りこぼしています」 |
 
 号車変更として扱うのは矢印表記 (`→` `⇒` `➡` `->` `=>`) のみ。`giga05-06` `giga05〜06` は「変更」か「範囲」か判別できないため補正せず警告する。
 
@@ -113,6 +117,69 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 過去の legs.json には `重要運行_giga03` (〜2026-07-06 の形式) や日付末尾の `_重要運行` が残っている。重複判定 (`legs_dedup_key`) はこのマーカーを外してから比較するため、同じ運行が二重登録されることはない (`merge_legs.py` 側も同一ロジック)。
 
 Slack本文が `【重要運行】` で Teams会議件名に号車がある場合は、Teams 側の号車が採用される (これは正常フロー)。**他号車の会議室を流用して投稿された場合は誤った号車が確定するが、判別する材料がないため検知できない。**
+
+### 号車の絞り込み (`track_filter`)
+
+チャンネルに複数号車の投稿が流れる場合、`track_filter` で**取り込む号車を限定**できる (未指定なら全号車が対象で、挙動は従来どおり)。
+
+```json
+"track_filter": ["giga03", "giga04"]
+```
+
+指定値も投稿側の表記も `normalize_trackname()` で正規化してから比較するため、`GIGA03` `ｇｉｇａ０３` `giga3` はすべて `giga03` として一致する。
+
+#### 判定は 2 回行う
+
+号車は Slack本文と Teams会議件名の2箇所から決まり、**会議件名の方が強い** (「号車表記 (Trackname) の扱い」参照)。そのため判定も 2 段階になっている。
+
+| | いつ | 何のため |
+|---|---|---|
+| ① | Slack本文を読んだ直後 (会議を引く前) | 対象外と分かっている投稿で Teams会議を取得しない (他号車の投稿が多いチャンネルを追加しても API 呼び出しと実行時間が増えない) |
+| ② | 会議件名で号車が確定した後 | `【重要運行】`・`【giga100】`・号車なしの投稿は①を素通りするため。**②が無いと対象外号車が legs.json に混ざる** |
+
+| Slack本文の号車 | 会議件名の号車 | `["giga03","giga04"]` 指定時 |
+|---|---|---|
+| `【giga03】` `【GIGA03】` `【giga3】` | `【giga03】` | ✅ 取り込む |
+| `【giga06】` | (引かない) | **①で除外** |
+| `【giga05→06】` (号車変更) | `【giga06】` | ✅ 取り込む (`giga06` として判定) |
+| `【giga05→06】` (号車変更) | — | **①で除外** (`giga06` は対象外のため) |
+| `【重要運行】` `【giga100】` `【　】`なし | `【giga03】` | ✅ 取り込む (号車は会議件名で確定) |
+| `【重要運行】` `【giga100】` `【　】`なし | `【giga06】` | **②で除外** |
+| `【重要運行】` `【giga100】` `【　】`なし | 会議が引けない | ✅ 除外しない。従来どおり `⚠️ 要確認` / `❌ failed` に出す |
+| `【giga03】` (対象) | `【giga06】` (対象外) | **②で除外**し、`⚠️ 要確認` に明細を出す (会議室の流用・投稿ミスの可能性) |
+
+**号車が確定していない投稿は絞り込みで消さない**方針。無言で件数が減るより、`⚠️ 要確認` / `❌ failed` として人が見て判断する方を優先している。
+
+#### 通知の出方
+
+除外した投稿は完了通知に件数だけ出る (毎回同じ号車が並んで `⚠️ 要確認` が埋まるのを避けるため明細は出さない)。
+
+```
+対象日: 2026-09-09
+対象外号車のためスキップ: 5 件 (track_filter)
+```
+
+例外は上表の最終行 (Slack本文は対象号車なのに会議件名が対象外) で、これだけは `⚠️ 要確認` に明細と URL が出る。
+
+#### 既存 legs.json に残っている対象外号車も取り除く
+
+`--append` (config の `"append": true`) で既存 legs.json に追記する場合、**既存レコードにも `track_filter` を掛ける**。絞り込みを始める前に取り込んだ対象外号車が残り続けないようにするため。取り除いた件数は通知に出る。
+
+```
+対象外号車のため既存 legs.json から除外: 3 件 (track_filter)
+```
+
+`append` が false のときは毎回 legs.json を作り直すため、そもそも対象外号車は残らない。**本番 legs.json (merge_legs.py の取り込み先) からは削除しない** — merge_legs.py は追記専用で、既存レコードを消さない設計のため。
+
+`track_filter` に `gigaNN` として解釈できない値 (`giga3O` のような打ち間違い等) を書くと、**その値はどの投稿とも一致せず全件が除外され得る**。気付けるよう、起動時に警告し `⚠️ 要確認` にも出す。
+
+```
+・config の track_filter の値 'giga3O' は号車として解釈できません (【giga05】形式で指定してください)。この値に一致する投稿はありません
+```
+
+#### 取り込み直すとき
+
+除外された投稿は logs.json にも記録されない。そのため `track_filter` から外したうえで、その投稿日を含む `content_date` を指定して再実行すれば取り込み直せる (取得範囲は対象日の投稿日 ±14 日)。
 
 ### 認証
 
@@ -216,6 +283,7 @@ nano config.json
     "driver-a@example.com",
     "driver-b@example.com"
   ],
+  "track_filter": ["giga03", "giga04"],
   "legs_out": "legs.json",
   "logs_out": "logs.json",
   "notify_webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
@@ -228,7 +296,9 @@ nano config.json
 | `channel` | 対象 Slack チャンネル ID の配列 |
 | `content_date` | 対象日 (`today` `yesterday` `tomorrow` `YYYY-MM-DD` `N_days_ago` 等) |
 | `track_calendars` | ドライバーのメール/UPN (カレンダー共有が必要) |
+| `track_filter` | 取り込む号車のホワイトリスト (省略時は全号車) |
 | `notify_webhook_url` | 完了通知用 Webhook URL (運行チャンネル) |
+| `notify_mentions` | `❌ failed` のときにメンションする相手 (メンバーID `U...` の配列) |
 | `start_notify_webhook_url` | 開始通知用 Webhook URL (個人DM) |
 
 ### 5. Bot をチャンネルに招待
@@ -561,6 +631,67 @@ journalctl --user -u zp-summary.service --since "1min ago" --no-pager | grep "tr
 
 ---
 
+## 取り込む号車を変えるとき
+
+チャンネルに他号車の投稿も流れていて、**特定の号車だけを legs.json に入れたい**場合に設定する (仕組みは [号車の絞り込み](#号車の絞り込み-track_filter))。設定しなければ全号車が対象。
+
+### Step 1: config.json に `track_filter` を書く
+
+```bash
+nano ~/Downloads/zp_summary/config.json
+```
+
+```json
+"track_filter": ["giga03", "giga04"],
+```
+
+- **正規表記 (`gigaNN`) で書く。** `giga3O` (数字の 0 と英字の O) のような値はどの投稿とも一致せず、全件が除外され得る
+- 絞り込みをやめるときは行ごと消すか `"track_filter": []` にする
+
+### Step 2: JSON 構文チェック
+
+```bash
+python3 -m json.tool ~/Downloads/zp_summary/config.json > /dev/null && echo "JSON OK" || echo "JSON NG"
+```
+
+### Step 3: 本番を汚さずに動作確認
+
+`--legs-out` `--logs-out` を一時ファイルに向け、`--notify-webhook-url` を付けなければ、**本番の legs.json / logs.json と Slack 通知に影響せず**に確認できる。
+
+```bash
+cd ~/Downloads/zp_summary
+.venv/bin/python slack_attachment_reader.py \
+  --content-date yesterday \
+  --track-filter giga03 giga04 \
+  --legs-out /tmp/legs_test.json --logs-out /tmp/logs_test.json
+```
+
+ログの `[filter] 対象外号車のためスキップ` 行と、`/tmp/legs_test.json` に入った号車を確認する。
+
+```bash
+python3 -c "import json;print([r[0] for r in json.load(open('/tmp/legs_test.json'))])"
+```
+
+### Step 4: 反映
+
+config.json を保存すれば次回の timer 実行から効く (systemd の再読み込みは不要)。すぐ試すなら:
+
+```bash
+systemctl --user start zp-summary.service
+journalctl --user -u zp-summary.service --since "1min ago" --no-pager | grep -E "track_filter|filter\]"
+```
+
+### 除外しすぎた / 除外できていないとき
+
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| 対象の号車が入らない | `track_filter` の打ち間違い | 通知の `⚠️ 要確認` に「号車として解釈できません」が出ていないか確認 |
+| 対象外の号車が入る | 号車が `【重要運行】` で会議件名も対象号車になっている | 仕様どおり (会議件名が正) 。会議件名を直す |
+| 対象の号車が「会議件名が対象外」でスキップされる | 他号車の会議室を流用している | 会議件名を正しい号車に直して再実行 |
+| 除外した分を取り込み直したい | — | `track_filter` から外し、`--content-date YYYY-MM-DD` を指定して再実行 (±14日以内の投稿) |
+
+---
+
 ## Slack通知を変えるとき
 
 ### Webhook URL を新規発行する場合
@@ -579,6 +710,44 @@ nano ~/Downloads/zp_summary/config.json
 
 - `notify_webhook_url` を変更 → 完了通知先を変更
 - `start_notify_webhook_url` を変更 → 開始通知先を変更
+
+### 失敗時にメンバーをメンションする
+
+`❌ failed` が普通の投稿に埋もれて気付かれないのを防ぐため、失敗時だけメンションを飛ばせる。
+
+**Step 1: メンバーIDを調べる**
+
+Slack でその人のプロフィールを開く → 「その他」(⋮) → **メンバーIDをコピー**。`U01ABCDEF` のような文字列。
+
+**Step 2: config.json に書く**
+
+```json
+"notify_mentions": ["U01ABCDEF", "U02GHIJKL"],
+```
+
+| 書ける値 | 変換後 |
+|---|---|
+| `U01ABCDEF` (メンバーID) | `<@U01ABCDEF>` |
+| `S01XYZABC` (ユーザーグループID) | `<!subteam^S01XYZABC>` |
+| `here` / `channel` | `<!here>` / `<!channel>` |
+
+**表示名 (`@田中`) は書かない。** Webhook 側で ID に解決されず通知が飛ばないため、`[警告]` を出して無視する (本文にも出さない)。
+
+**Step 3: 動作確認**
+
+```bash
+cd ~/Downloads/zp_summary
+MENTION=$(python3 -c "import json; print(' '.join('<@%s>' % m for m in json.load(open('config.json')).get('notify_mentions', [])))")
+END_URL=$(python3 -c "import json; print(json.load(open('config.json')).get('notify_webhook_url', ''))")
+curl -X POST -H 'Content-type: application/json' \
+  --data "{\"text\":\"$MENTION メンションテスト\"}" "$END_URL"
+```
+
+対象の人に通知が飛べばOK (名前が青くリンクになっていればID解決に成功している)。
+
+> config.json 自体が壊れて起動時に落ちた場合は config を読めないため、メンションも飛ばせない。
+> その状況でも飛ばしたいときは環境変数 `ZP_NOTIFY_MENTIONS="U01ABCDEF,U02GHIJKL"` を
+> systemd ユニットに設定しておく (`ZP_NOTIFY_WEBHOOK_URL` と同じ用途)。
 
 ### Webhook 単独テスト
 

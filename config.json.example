@@ -15,6 +15,9 @@
   ],
   "_comment_track_calendars": "共有された予定表を持つドライバーのメール/UPN",
 
+  "track_filter": ["giga03", "giga04"],
+  "_comment_track_filter": "取り込む号車のホワイトリスト。省略/空なら全号車。表記ゆれ (GIGA03 / giga3 / giga05→06) は正規化してから判定。号車が空・【重要運行】など号車が確定しない投稿は除外せず通し、通知で確認させる",
+
   "append": false,
   "_comment_append": "true: 既存のlegs.jsonに追記 (重複は自動スキップ)",
 
@@ -23,6 +26,9 @@
 
   "notify_webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
   "_comment_notify_webhook_url": "完了通知用のSlack Incoming Webhook URL",
+
+  "notify_mentions": ["U01ABCDEF", "U02GHIJKL"],
+  "_comment_notify_mentions": "❌ failed のときだけメンションする相手。Slackのプロフィール →「メンバーIDをコピー」の U で始まるID。ユーザーグループID (S...) や here / channel も指定可。表示名 (@田中) は通知が飛ばないため無視され警告が出る",
 
   "start_notify_webhook_url": "https://hooks.slack.com/services/AAA/BBB/CCC",
   "_comment_start_notify_webhook_url": "開始通知用のSlack Incoming Webhook URL (個人DM用)"

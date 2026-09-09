@@ -213,6 +213,34 @@ def normalize_trackname(track: str) -> str:
     return s
 
 
+def parse_track_filter(values) -> set:
+    """track_filter 設定を正規化済み号車の集合にする。空 (未指定) なら絞り込み無効。"""
+    if not values:
+        return set()
+    items = values if isinstance(values, list) else [values]
+    return {normalize_trackname(v) for v in items if str(v).strip()}
+
+
+def track_allowed(track: str, allow: set) -> bool:
+    """号車が取り込み対象か。allow が空なら常に True (絞り込み無効)。
+
+    号車を読めなかった投稿 (空) ・【重要運行】 (giga番号が未確定) ・【giga05→06】 の
+    ような一意に定まらない表記は、ここでは落とさず True を返す。号車が確定していない
+    ものを無言で消すと気付けないため。
+
+    run() はこれを **2 回** 呼ぶ: ①Slack本文の号車 (Teams会議を引く前。対象外と分かって
+    いる投稿で Graph を叩かないため) ②Teams会議件名で確定した号車 (①を通り抜けた
+    【重要運行】・号車なしの投稿を取りこぼさないため)。①だけだと対象外号車が
+    legs.json に混ざる。
+    """
+    if not allow:
+        return True
+    norm = normalize_trackname(track)
+    if norm == "重要運行" or not TRACK_CANONICAL_RE.match(norm):
+        return True
+    return norm in allow
+
+
 def set_trackname(meta: dict, raw: str, source: str) -> None:
     """号車表記を正規化して meta に格納し、正規形と違っていれば警告を積む。
 
@@ -675,6 +703,38 @@ def atomic_write_json(path: str, data) -> None:
         raise
 
 
+def format_mentions(values) -> str:
+    """❌ failed 通知に付けるメンションを Slack 記法へ変換する。
+
+    'U01ABCDEF' (メンバーID) → '<@U01ABCDEF>' / 'S01ABCDEF' (ユーザーグループID) →
+    '<!subteam^S01ABCDEF>' / 'here' 'channel' → '<!here>' '<!channel>'。
+    '<@U01ABCDEF>' のように既に記法で書かれていればそのまま使う。
+
+    表示名 (@田中) は Webhook 側で ID に解決されず、ただの文字列として送られて
+    通知が飛ばない。黙って無視すると「メンションしたのに気付けない」ので警告を出す。
+    """
+    if not values:
+        return ""
+    items = values if isinstance(values, list) else [values]
+    out: list = []
+    for v in items:
+        s = str(v).strip().lstrip("@")
+        if not s:
+            continue
+        if s.startswith("<"):
+            out.append(s)
+        elif s.lower() in ("here", "channel"):
+            out.append(f"<!{s.lower()}>")
+        elif re.fullmatch(r'S[A-Z0-9]{6,}', s):
+            out.append(f"<!subteam^{s}>")
+        elif re.fullmatch(r'[UW][A-Z0-9]{6,}', s):
+            out.append(f"<@{s}>")
+        else:
+            log(f"[警告] notify_mentions の値 '{v}' はメンバーID/グループIDではないため無視します "
+                f"(Slackのプロフィール → 「メンバーIDをコピー」の U から始まる文字列を指定)")
+    return " ".join(out)
+
+
 def send_slack_notification(webhook_url: str, text: str) -> None:
     if not webhook_url:
         # 通知先未設定を黙って無視すると「通知が来ない」ことに気付けないため必ず残す
@@ -714,12 +774,20 @@ def resolve_relative_date(value: str | None) -> "date | None":
 
 def build_notification(legs_records: list, target_date: "date | None",
                        legs_new_count: int, legs_skipped_count: int,
-                       format_warns: list = (), errors: list = ()) -> str:
+                       format_warns: list = (), errors: list = (),
+                       filtered_count: int = 0, existing_dropped: int = 0,
+                       mentions: str = "") -> str:
     """完了通知テキスト (✅ success / ❌ failed / 🔁 skipped) を組み立てる。
     legs_skipped_count は URL重複・dedupキー重複の両方を合算した件数。
     format_warns は人が確認すべき事象 [(警告文, URL), ...] (号車表記の補正・非正規表記・
     日付が読めずスキップした投稿など)。ステータスは変えず ⚠️ 要確認として列挙する。
-    errors は処理中に発生した異常の一覧。1 件でもあれば ✅ success は出さない。"""
+    errors は処理中に発生した異常の一覧。1 件でもあれば ✅ success は出さない。
+    filtered_count は track_filter で対象外号車として除外した投稿数 (件数のみ報告する。
+    毎回同じ号車が並んで ⚠️ 要確認 が埋まるのを避けるため明細は出さない)。
+    existing_dropped は append 時に既存 legs.json から取り除いた対象外号車のレコード数
+    (件数だけだと消えたことに気付けないので、0 件でなければ必ず行を出す)。
+    mentions は ❌ failed のときだけ先頭に付けるメンション (format_mentions の戻り値)。
+    ✅ success / 🔁 skipped では付けない (毎日メンションが飛ぶと見なくなるため)。"""
     incomplete: set = set()
     for i, rec in enumerate(legs_records):
         ok, _ = is_legs_record_complete(rec)
@@ -742,9 +810,14 @@ def build_notification(legs_records: list, target_date: "date | None",
     else:
         status = "✅ success: 運行記録の読み込みが完了しました"
 
-    lines = [status]
+    lines = [f"{mentions} 対応をお願いします", status] if (mentions and status.startswith("❌")) \
+        else [status]
     if target_date:
         lines.append(f"対象日: {target_date.isoformat()}")
+    if filtered_count:
+        lines.append(f"対象外号車のためスキップ: {filtered_count} 件 (track_filter)")
+    if existing_dropped:
+        lines.append(f"対象外号車のため既存 legs.json から除外: {existing_dropped} 件 (track_filter)")
     MAX = 30
     for i, rec in enumerate(legs_records[:MAX]):
         track = rec[0] or "(Trackname不明)"
@@ -778,11 +851,14 @@ def build_notification(legs_records: list, target_date: "date | None",
     return "\n".join(lines)
 
 
-def build_crash_notification(exc: BaseException, target_date: "date | None") -> str:
-    """異常終了時の通知テキスト。完了通知が出せないまま落ちた場合に使う。"""
+def build_crash_notification(exc: BaseException, target_date: "date | None",
+                             mentions: str = "") -> str:
+    """異常終了時の通知テキスト。完了通知が出せないまま落ちた場合に使う。
+    異常終了は常に ❌ failed なので、mentions があれば必ず先頭に付ける。"""
     tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
     tail = "".join(tb[-3:]).strip()
-    lines = ["❌ failed: zp_summary が異常終了しました "
+    lines = ([f"{mentions} 対応をお願いします"] if mentions else []) + \
+            ["❌ failed: zp_summary が異常終了しました "
              "(運行記録が更新されていない可能性があります)"]
     if target_date:
         lines.append(f"対象日: {target_date.isoformat()}")
@@ -817,6 +893,8 @@ def parse_args() -> argparse.Namespace:
                    help="Teams会議の実日付がこの日の投稿のみ (YYYY-MM-DD/today/yesterday/N_days_ago 等)")
     p.add_argument("--track-calendars", nargs="+", default=None,
                    help="共有予定表を引くドライバーのメール/UPN (Calendars.Read.Shared)")
+    p.add_argument("--track-filter", nargs="+", default=None,
+                   help="取り込む号車のホワイトリスト (例: giga03 giga04)。未指定なら全号車")
     p.add_argument("--append", action="store_true",
                    help="既存 legs.json に追記 (Trackname+日付+往路/復路 で重複スキップ)")
     p.add_argument("--out", default=None, help="結果JSONの出力先 (省略時は標準出力)")
@@ -824,6 +902,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--logs-out", default=None,
                    help="処理済み投稿の投稿日履歴。次回はこの最新日以降のみ取得")
     p.add_argument("--notify-webhook-url", default=None, help="完了通知用 Slack Webhook")
+    p.add_argument("--notify-mentions", nargs="+", default=None,
+                   help="❌ failed のときにメンションする相手 (メンバーID U... / "
+                        "ユーザーグループID S... / here / channel)")
     p.add_argument("--start-notify-webhook-url", default=None, help="開始通知用 Slack Webhook")
     p.add_argument("--debug", action="store_true", help="詳細ログを表示")
 
@@ -847,6 +928,20 @@ def run(args: argparse.Namespace, state: dict) -> int:
         sys.exit("エラー: --channel もしくは config.json の \"channel\" 指定が必要です")
     channels = [c for c in (args.channel if isinstance(args.channel, list)
                             else [args.channel]) if c]
+
+    mentions = state.get("mentions", "")
+    track_allow = parse_track_filter(getattr(args, "track_filter", None))
+    # 正規形 (gigaNN) でない指定値はどの投稿とも一致せず、全件が対象外として
+    # 消える。設定ミスに気付けるよう通知にも出す (打ち間違い・全角の打ち漏らし)
+    invalid_filter = sorted(t for t in track_allow if not TRACK_CANONICAL_RE.match(t))
+    if track_allow:
+        log(f"[情報] track_filter = {', '.join(sorted(track_allow))} (対象外の号車は取り込まない)")
+    filter_warns: list = []
+    for t in invalid_filter:
+        log(f"[警告] track_filter の値 '{t}' は号車として解釈できません (どの投稿とも一致しません)")
+        filter_warns.append((
+            f"config の track_filter の値 '{t}' は号車として解釈できません "
+            f"(【giga05】形式で指定してください)。この値に一致する投稿はありません", ""))
 
     client = WebClient(token=get_token())
     from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
@@ -912,7 +1007,8 @@ def run(args: argparse.Namespace, state: dict) -> int:
         if args.notify_webhook_url:
             send_slack_notification(
                 args.notify_webhook_url,
-                build_notification([], target_date, 0, 0, [], errors))
+                build_notification([], target_date, 0, 0, filter_warns, errors,
+                                   mentions=mentions))
         return len(errors)
     log(f"\n合計 {len(posts)} 件のTeams投稿を処理します...")
 
@@ -938,8 +1034,18 @@ def run(args: argparse.Namespace, state: dict) -> int:
     existing_keys: set = set()
     existing_urls: set = set()
     legs_skipped_count = 0
+    existing_dropped = 0
     if args.append and args.legs_out:
         for rec in read_json_list(args.legs_out):
+            # 既存レコードにも track_filter を掛ける。掛けないと、絞り込みを始める前に
+            # 取り込んだ対象外号車が legs.json に残り続ける (追記のたびに再出力される)
+            if track_allow:
+                rec_track = rec[0] if isinstance(rec, list) and rec \
+                    else (rec.get("Trackname", "") if isinstance(rec, dict) else "")
+                if not track_allowed(rec_track, track_allow):
+                    existing_dropped += 1
+                    log(f"[legs] 対象外号車のため既存レコードを除外: 【{rec_track}】")
+                    continue
             k = legs_dedup_key(rec)
             if any(k):
                 if k in existing_keys:
@@ -955,8 +1061,9 @@ def run(args: argparse.Namespace, state: dict) -> int:
 
     legs_records: list = []
     url_to_posted_iso: dict = {}
-    format_warns: list = []
+    format_warns: list = list(filter_warns)
     skipped_count = 0
+    filtered_count = 0
     total = len(posts)
     for idx, f in enumerate(posts, 1):
         log(f"  [{idx}/{total}] {f.get('name', '?')[:60]}")
@@ -965,6 +1072,13 @@ def run(args: argparse.Namespace, state: dict) -> int:
                       if f.get("_posted_ts") else "")
         try:
             meta = extract_tracking_metadata(msg, client, user_cache, default_year)
+            # ①Slack本文の号車で判定。Graph を叩く前なので、他号車の投稿が多い
+            # チャンネルを追加しても Teams会議の取得回数と実行時間が増えない
+            slack_track = meta.get("Trackname", "")
+            if not track_allowed(slack_track, track_allow):
+                filtered_count += 1
+                log(f"    [filter] 対象外号車のためスキップ: 【{slack_track}】")
+                continue
             teams_urls = extract_teams_urls(msg)
             if teams_urls:
                 meeting = get_teams_meeting(teams_urls[0], graph_token)
@@ -979,6 +1093,23 @@ def run(args: argparse.Namespace, state: dict) -> int:
                     apply_teams_meeting(meta, meeting, args.debug)
             else:
                 log("    [teams診断] Teams URL なし")
+
+            # ②Teams会議件名で号車が確定した後にもう一度判定する。【重要運行】や
+            # 号車なしの投稿は①を通り抜けるため、ここで見ないと対象外号車が混ざる
+            teams_track = meta.get("Trackname", "")
+            if not track_allowed(teams_track, track_allow):
+                filtered_count += 1
+                log(f"    [filter] 対象外号車のためスキップ (Teams会議件名で確定): 【{teams_track}】")
+                if normalize_trackname(slack_track) in track_allow:
+                    # Slack本文は対象号車なのに Teams側が対象外 = 会議室の流用や
+                    # 投稿ミスの可能性。件数だけだと気付けないので明細を出す
+                    format_warns.append((
+                        f"Slack本文は対象号車 【{slack_track}】 ですが、Teams会議件名が "
+                        f"対象外の 【{teams_track}】 のためスキップしました "
+                        f"(track_filter): {meta.get('_title_line', '')[:40]}",
+                        get_message_permalink(client, f.get("_channel_id", ""), f["_posted_ts"])
+                        if f.get("_posted_ts") and f.get("_channel_id") else ""))
+                continue
 
             if target_date is not None and meta.get("_title_date") != target_date:
                 if meta.get("_title_date") is None:
@@ -1076,7 +1207,8 @@ def run(args: argparse.Namespace, state: dict) -> int:
         send_slack_notification(
             args.notify_webhook_url,
             build_notification(legs_records, target_date, legs_new_count,
-                               legs_skipped_count + skipped_count, format_warns, errors))
+                               legs_skipped_count + skipped_count, format_warns, errors,
+                               filtered_count, existing_dropped, mentions))
     return len(errors)
 
 
@@ -1100,16 +1232,40 @@ def fallback_notify_webhook() -> str:
         return ""
 
 
+def fallback_notify_mentions() -> str:
+    """parse_args が失敗しても メンション先を得るための最終手段。
+
+    config.json 自体が壊れて落ちたときこそ人が気付く必要があるため、
+    環境変数 ZP_NOTIFY_MENTIONS (空白/カンマ区切り) → config.json の生読み の順に探す。
+    config.json が壊れて読めない場合に効くのは環境変数の方だけ。
+    """
+    env = os.environ.get("ZP_NOTIFY_MENTIONS", "")
+    if env:
+        return format_mentions(env.replace(",", " ").split())
+    path = "config.json"
+    if "--config" in sys.argv:
+        i = sys.argv.index("--config")
+        if i + 1 < len(sys.argv):
+            path = sys.argv[i + 1]
+    try:
+        with open(path, encoding="utf-8") as f:
+            return format_mentions(json.load(f).get("notify_mentions"))
+    except Exception:
+        return ""
+
+
 def main() -> None:
     """引数解析 → run()。どこで落ちても Slack に ❌ failed を通知して非ゼロ終了する。
 
     通知先が分かる前 (config.json の読み込み失敗など) に落ちた場合は
-    fallback_notify_webhook() で通知先を探す。
+    fallback_notify_webhook() / fallback_notify_mentions() で通知先を探す。
     """
     webhook, state, error_count = "", {}, 0
     try:
         args = parse_args()
         webhook = args.notify_webhook_url or ""
+        # run() より前に確定させる。run() の途中で落ちてもクラッシュ通知でメンションできる
+        state["mentions"] = format_mentions(getattr(args, "notify_mentions", None))
         error_count = run(args, state)
     except KeyboardInterrupt:
         raise
@@ -1128,7 +1284,8 @@ def main() -> None:
 
 
 def _notify_crash(exc: BaseException, state: dict, webhook: str) -> None:
-    text = build_crash_notification(exc, state.get("target_date"))
+    mentions = state.get("mentions") or fallback_notify_mentions()
+    text = build_crash_notification(exc, state.get("target_date"), mentions)
     log(text)
     send_slack_notification(webhook or fallback_notify_webhook(), text)
 
