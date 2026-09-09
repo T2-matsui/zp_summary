@@ -45,17 +45,39 @@ def log(msg: str) -> None:
 # ---------- legs 形式 ----------
 
 GIGA_NORMALIZABLE_RE = re.compile(r'^giga\s*(\d{1,2})$', re.IGNORECASE)
+# 号車変更表記 (giga05→06 等)。変更後 = 最後の号車を採用する
+GIGA_CHANGE_RE = re.compile(
+    r'^giga\s*\d{1,2}(?:\s*(?:→|⇒|➡|=>|->)\s*(?:giga\s*)?\d{1,2})+$', re.IGNORECASE)
 
 
 def normalize_trackname(track: str) -> str:
     """号車表記を正規形 (半角小文字 giga + 2桁) に揃える。
 
     'GIGA05' 'ｇｉｇａ０５' 'giga5' → 'giga05' / '重要運行' → '重要運行'
+    号車変更表記 'giga05→06' は変更後 (最後) の号車 'giga06' を採用する。
     slack_attachment_reader.normalize_trackname と同一ロジック。両方を揃えること。
     """
     s = unicodedata.normalize("NFKC", track or "").strip()
     m = GIGA_NORMALIZABLE_RE.match(s)
-    return f"giga{m.group(1).zfill(2)}" if m else s
+    if m:
+        return f"giga{m.group(1).zfill(2)}"
+    if GIGA_CHANGE_RE.match(s):
+        return f"giga{re.findall(r'(\d{1,2})', s)[-1].zfill(2)}"
+    return s
+
+
+IMPORTANT_TAG_RE = re.compile(r'(?:^重要運行[_＿]|[_＿]重要運行$)')
+
+
+def strip_important_tag(value: str) -> str:
+    """過去の legs.json に残る「重要運行」マーカーを取り除く (重複判定でのみ使う)。
+
+    旧形式 '重要運行_giga03' (〜2026-07-06) や '2026/06/22_重要運行' のレコードが
+    本番に残っているため、マーカーの有無だけで同じ運行が二重登録されないよう、
+    dedup キーの比較時に限って外す。出力する表記は変えない。
+    slack_attachment_reader.strip_important_tag と同一ロジック。両方を揃えること。
+    """
+    return IMPORTANT_TAG_RE.sub("", value or "").strip()
 
 
 def legs_dedup_key(rec) -> tuple:
@@ -78,7 +100,9 @@ def legs_dedup_key(rec) -> tuple:
         return ("", "", "")
     date_str = date_part.split("|", 1)[1] if "|" in date_part else ""
     direction = next((w for w in ("往路", "復路") if w in luggage), "")
-    return (normalize_trackname(track), date_str, direction)
+    # 「重要運行」マーカーは比較前に外す (旧形式のレコードとの二重登録を防ぐ)
+    return (normalize_trackname(strip_important_tag(track)),
+            strip_important_tag(date_str), direction)
 
 
 def dumps_legs(records: list) -> str:

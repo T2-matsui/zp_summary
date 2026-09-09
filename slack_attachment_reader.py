@@ -51,6 +51,9 @@ CUSTOMER_TAIL_ARROW_RE = re.compile(r'→')
 TRACK_CANONICAL_RE = re.compile(r'^(?:giga\d{2}|重要運行)$')
 # 正規化できる号車表記 (NFKC 後に giga+1〜2桁とみなせるもの)
 GIGA_NORMALIZABLE_RE = re.compile(r'^giga\s*(\d{1,2})$', re.IGNORECASE)
+# 号車変更表記 (giga05→06 / GIGA05->giga06 等)。変更後 = 最後の号車を採用する
+GIGA_CHANGE_RE = re.compile(
+    r'^giga\s*\d{1,2}(?:\s*(?:→|⇒|➡|=>|->)\s*(?:giga\s*)?\d{1,2})+$', re.IGNORECASE)
 DRIVER_LINE_RE = re.compile(
     rf'ドライバー\s*{_PAREN_O}幹線{_PAREN_C}\s*{_COLON}\s*<@(U[A-Z0-9]+)>')
 OPERATOR_LINE_RE = re.compile(
@@ -195,13 +198,19 @@ def normalize_trackname(track: str) -> str:
     """号車表記を正規形 (半角小文字 giga + 2桁) に揃える。
 
     'GIGA05' 'ｇｉｇａ０５' 'giga5' → 'giga05' / '重要運行' → '重要運行'
-    'giga05→06' のように号車が一意に定まらない表記は NFKC 正規化だけして返す。
+    号車変更表記 'giga05→06' は **変更後 (最後) の号車** 'giga06' を採用する。
+    'giga100' のようにどの号車か決められない表記は NFKC 正規化だけして返す。
     出力 (build_legs_record) と重複判定 (legs_dedup_key) の両方がここを通るので、
     表記ゆれが別レコードとして二重登録されない。merge_legs.py 側にも同じ関数がある。
     """
     s = unicodedata.normalize("NFKC", track or "").strip()
     m = GIGA_NORMALIZABLE_RE.match(s)
-    return f"giga{m.group(1).zfill(2)}" if m else s
+    if m:
+        return f"giga{m.group(1).zfill(2)}"
+    if GIGA_CHANGE_RE.match(s):
+        # 「05→06」= 06 に変更された、の意。変更後の号車で運行している
+        return f"giga{TRACKNUM_RE.findall(s)[-1].zfill(2)}"
+    return s
 
 
 def set_trackname(meta: dict, raw: str, source: str) -> None:
@@ -220,6 +229,10 @@ def set_trackname(meta: dict, raw: str, source: str) -> None:
     if not TRACK_CANONICAL_RE.match(norm):
         meta.setdefault("_warn", []).append(
             f"{source}の号車表記が非正規で自動補正できません: 【{track}】 (正規: 【giga05】形式)")
+    elif GIGA_CHANGE_RE.match(unicodedata.normalize("NFKC", track).strip()):
+        # 号車変更は「どちらの号車で走ったか」の判断が入るため、補正内容を明示する
+        meta.setdefault("_warn", []).append(
+            f"{source}の号車変更表記から変更後の号車を採用しました: 【{track}】 → 【{norm}】")
     elif norm != track:
         meta.setdefault("_warn", []).append(
             f"{source}の号車表記を補正しました: 【{track}】 → 【{norm}】")
@@ -493,15 +506,16 @@ def build_legs_record(meta: dict, url: str) -> list:
         return re.sub(r"^\s*【\s*giga\d+\s*】\s*", "", v, flags=re.IGNORECASE)
 
     track = normalize_trackname(track)
-    # 「重要運行」は loaded_luggage の【gigaXX】から番号を拾って Trackname=gigaXX 等に補正
+    # 「重要運行」は loaded_luggage の【gigaXX】から番号を拾って Trackname=gigaXX に補正する。
+    # 「重要運行」であること自体はレコードに残さない (下流 zero-plotter が Trackname を
+    # 号車ID としてそのまま使っており、giga03 以外の値にすると Druid のデータソース名・
+    # 号車フィルタ・動画ディレクトリ検索が一致しなくなるため)
     if track == "重要運行":
         customer = unicodedata.normalize("NFKC", meta.get("Customer", "") or "")
         m = re.search(r"giga\s*(\d{1,2})", customer, re.IGNORECASE)
         if m:
             track = normalize_trackname(f"giga{m.group(1)}")
             track_num = m.group(1).zfill(2)
-            if date_str:
-                date_str = f"{date_str}_重要運行"
 
     return [
         track,
@@ -548,6 +562,20 @@ def is_legs_record_complete(rec) -> tuple[bool, list]:
     return len(missing) == 0, missing
 
 
+IMPORTANT_TAG_RE = re.compile(r'(?:^重要運行[_＿]|[_＿]重要運行$)')
+
+
+def strip_important_tag(value: str) -> str:
+    """過去の legs.json に残る「重要運行」マーカーを取り除く (重複判定でのみ使う)。
+
+    旧形式 '重要運行_giga03' (〜2026-07-06) や '2026/06/22_重要運行' のレコードが
+    本番に残っているため、マーカーの有無だけで同じ運行が二重登録されないよう、
+    dedup キーの比較時に限って外す。出力する表記は変えない。
+    merge_legs.py 側にも同じ関数がある。変更する場合は両方を揃えること。
+    """
+    return IMPORTANT_TAG_RE.sub("", value or "").strip()
+
+
 def legs_dedup_key(rec) -> tuple:
     """重複判定キー (Trackname, 日付, 往路/復路)。配列/dict 両形式に対応。
 
@@ -568,7 +596,9 @@ def legs_dedup_key(rec) -> tuple:
         return ("", "", "")
     date_str = date_part.split("|", 1)[1] if "|" in date_part else ""
     direction = next((w for w in ("往路", "復路") if w in liggage), "")
-    return (normalize_trackname(track), date_str, direction)
+    # 「重要運行」マーカーは比較前に外す (旧形式のレコードとの二重登録を防ぐ)
+    return (normalize_trackname(strip_important_tag(track)),
+            strip_important_tag(date_str), direction)
 
 
 # ---------- I/O ----------
