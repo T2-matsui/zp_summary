@@ -425,6 +425,14 @@ def apply_teams_meeting(meta: dict, meeting: dict, debug: bool = False) -> None:
 
 # ---------- legs.json レコード ----------
 
+def _direction_of(luggage: str) -> str:
+    """loaded_luggage から運行方向 (往路/復路) を取り出す。無ければ空文字。
+
+    legs_dedup_key が重複判定に使うのと同じ語を見る。
+    """
+    return next((w for w in ("往路", "復路") if w in (luggage or "")), "")
+
+
 def build_legs_record(meta: dict, url: str) -> list:
     """legs.json レコード [Trackname, "Track-num|YY/MM/DD", "開始ISO/終了ISO",
     {SW-version, selfdrive_section, loaded_luggage, url}] を作る (跨日OK)。"""
@@ -448,6 +456,18 @@ def build_legs_record(meta: dict, url: str) -> list:
         return re.sub(r"^\s*【\s*giga\d+\s*】\s*", "", v, flags=re.IGNORECASE)
 
     track = _giga(track)
+    luggage = _strip_giga_tag(_giga(meta.get("Customer", "")))
+
+    # 同日 2 便は leg[1] が同一値になり、csv_exported/x/main.js が leg[1] をキーに
+    # 一意化するため UI 上で片方が消える。区別できる情報を leg[1] に含める
+    direction = _direction_of(luggage)
+    if date_str and direction:
+        date_str = f"{date_str}({direction})"
+    elif date_str and teams_start:
+        # 方向が取れない同日 2 便 (日勤と夜勤など) は開始時刻で分ける。開始時刻は
+        # Teams 会議から取るので再実行しても同じ値になり、重複スキップは効いたままになる
+        date_str = f"{date_str}({teams_start.strftime('%H:%M')})"
+
     # 「重要運行」は loaded_luggage の【gigaXX】から番号を拾って Trackname=gigaXX 等に補正
     if track == "重要運行":
         m = re.search(r"giga(\d+)", _giga(meta.get("Customer", "")), re.IGNORECASE)
@@ -464,7 +484,7 @@ def build_legs_record(meta: dict, url: str) -> list:
         {
             "SW-version": meta.get("SW-ver", ""),
             "selfdrive_section": meta.get("Route", ""),
-            "loaded_luggage": _strip_giga_tag(_giga(meta.get("Customer", ""))),
+            "loaded_luggage": luggage,
             "url": url,
         },
     ]
