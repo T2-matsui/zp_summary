@@ -55,7 +55,7 @@ python3 -c "import slack_sdk, requests, msal, dotenv; print('ok')"
 未インストールなら:
 
 ```bash
-pip3 install slack_sdk requests msal python-dotenv --break-system-packages
+pip3 install --user --no-deps -r requirements.txt
 ```
 
 ---
@@ -89,8 +89,9 @@ chmod +x legs_tools/zp_summary/run_zp_summary.sh legs_tools/zp_summary/merge_leg
 # Slack トークン
 install -m 600 -o integration-user -g integration-user /dev/null \
     /home/integration-user/zero-plotter/legs_tools/zp_summary/.env
-# → SLACK_BOT_TOKEN / SLACK_USER_TOKEN を記入
-#   merge_legs.py の通知を使うなら MERGE_LEGS_WEBHOOK_URL も追記
+# → SLACK_BOT_TOKEN (xoxb-...) を記入
+#   MERGE_LEGS_WEBHOOK_URL も必ず記入すること。未設定だと merge_legs.py の
+#   中断・ロールバックが Slack に通知されず、失敗に気づけない
 
 # Microsoft Graph のトークンキャッシュ
 #   ローカルの ~/.slack_attachment_reader_msal_cache.bin をコピーするか、
@@ -115,7 +116,9 @@ cp deploy/config.druid.json.example config.json
 # webhook URL を実値に置き換える
 ```
 
-`legs_out` / `logs_out` / `append: true` は雛形のまま変更しないこと。
+`legs_out` / `logs_out` / `append: true` / `content_date: yesterday` は雛形のまま
+変更しないこと。`content_date` を `today` にすると timer の 12:00 実行より後に投稿された
+当日分を拾えず、各回が自分の当日しか見ないため翌日以降の回でも回収されない。
 
 ---
 

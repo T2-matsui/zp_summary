@@ -67,7 +67,7 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 
 | 認証情報 | 用途 | scope/権限 |
 |---|---|---|
-| Slack Bot Token (`xoxb-`) | チャンネル読み取り | `channels:history` `channels:read` `groups:history` `groups:read` `users:read` `incoming-webhook` |
+| Slack Bot Token (`xoxb-`) | チャンネル読み取り | `channels:history` `users:read` (private は `groups:history`)。`channel` にチャンネル**名**を書く場合のみ `channels:read` / `groups:read` も必要 |
 | Slack Webhook URL (開始) | 個人DM通知 | scope不要 (URL自体が認証情報) |
 | Slack Webhook URL (完了) | 運行チャンネル通知 | scope不要 |
 | Microsoft Graph (MSAL) | Teams 会議情報 / ドライバー予定表 | `OnlineMeetings.Read` `Calendars.Read` `Calendars.Read.Shared` |
@@ -133,9 +133,21 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 
 ### 2. 依存ライブラリ
 
+**Python 3.10 以上が必須。** `slack_attachment_reader.py` が `from __future__ import
+annotations` 無しで PEP 604 の `X | None` を関数シグネチャに使っているため、3.9 以下は
+import した時点で `TypeError` になる。`python-dotenv` の最新版も `requires_python >= 3.10`。
+
 ```bash
-pip3 install slack_sdk requests msal python-dotenv --break-system-packages
+python3 -V                       # 3.10 以上であること
+pip3 install --user --no-deps -r requirements.txt
 ```
+
+- `--user` は `~/.local/lib/python3.x/site-packages` に入れる指定。システム領域を触らず、
+  `pip3 uninstall` や `rm -rf ~/.local/lib/python3.x/site-packages` で元に戻せる
+- `--no-deps` を付けるのは、`msal` の依存 (`requests` `PyJWT[crypto]` `cryptography`) が
+  OS 同梱版で足りている環境で、既存パッケージに触らせないため。足りない場合は外して実行する
+- **`legs_tools/requirements.txt` は使わないこと。** 別ツール用のファイルで、`slack_sdk` も
+  `python-dotenv` も入っていない一方 `requests>=2.28.0` と pandas 一式を要求する
 
 ### 3. `.env` 作成
 
@@ -564,9 +576,13 @@ TOKEN=$(grep '^SLACK_BOT_TOKEN' .env | cut -d= -f2 | tr -d '"' | tr -d ' ' | tr 
 curl -s -X POST "https://slack.com/api/auth.test" -H "Authorization: Bearer $TOKEN" -i | grep -i "x-oauth-scopes"
 ```
 
-必要なscope: `channels:history` `channels:read` `groups:history` `groups:read` `users:read` `incoming-webhook`
+必要なscope: `channels:history` `users:read` (private チャンネルは `groups:history`)
 
-- public チャンネルは `channels:history` / `channels:read`
+`config.json` の `channel` にチャンネル ID (`C…`) を直接書いている場合、`resolve_channel_id`
+は `conversations.list` を呼ばないため `channels:read` / `groups:read` は不要。チャンネル**名**
+で指定する場合だけ追加する。
+
+- public チャンネルは `channels:history`
 - **private チャンネルは `groups:history` / `groups:read` が必須**。`conversations.info` すら `missing_scope` を返す場合は対象が private の可能性が高い
 
 不足があれば Slack App画面で **Bot Token Scopes** に追加 → **reinstall your app** → 新トークンを `.env` に反映。private チャンネルでは Bot がメンバーである必要もある (`/invite @アプリ名`)。

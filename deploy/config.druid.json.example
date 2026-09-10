@@ -1,16 +1,14 @@
 {
   "_comment": "druid 用の設定雛形。コピーして config.json として使う (config.json は .gitignore で除外)。",
   "_comment_important": "legs_out は本番 legs.json ではなく専用ディレクトリを指すこと。本番への反映は merge_legs.py が行う。",
+  "_comment_removed_keys": "threads / extract / tracking_source / name_pattern は現行コードが解釈しないため削除した。書いても「未知のキー」として無視される。",
 
   "channel": ["C092KCPKHGE", "C092PN11KNZ", "C092KD3QEDU", "C0AN7M5LWR1"],
   "limit": 200,
-  "threads": false,
 
-  "content_date": "today",
+  "content_date": "yesterday",
   "_comment_content_date": "yyyy-mm-dd / today / yesterday / tomorrow / N_days_ago / N_days_later",
-
-  "extract": "tracking",
-  "tracking_source": "teams",
+  "_comment_content_date_druid": "druid では yesterday にする。timer は 12:00 実行なので today だと当日午後の投稿を拾えず、しかも各回が自分の当日しか見ないため取りこぼしが翌日以降も回収されない",
 
   "track_calendars": [
     "giga03@t2.auto",
@@ -18,8 +16,6 @@
     "giga05@t2.auto",
     "giga06@t2.auto"
   ],
-
-  "name_pattern": "^運行",
 
   "append": true,
   "_comment_append": "druid では必ず true。false だと legs_out を毎回ゼロから作り直すため、蓄積した生成物を失う",
