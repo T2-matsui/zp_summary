@@ -1,0 +1,13 @@
+[Unit]
+Description=zp_summary を日次実行
+
+[Timer]
+OnCalendar=*-*-* 12:00:00
+# マシン停止中に予定時刻を過ぎていたら起動後に実行する
+Persistent=true
+# Slack/Graph API へのアクセスが毎日同時刻に集中しないよう最大5分ずらす
+RandomizedDelaySec=300
+Unit=zp-summary.service
+
+[Install]
+WantedBy=timers.target

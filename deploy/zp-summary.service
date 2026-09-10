@@ -1,0 +1,38 @@
+[Unit]
+Description=zp_summary: Slack/Teams から運行記録を収集し legs.json へマージ
+Documentation=file:///home/integration-user/zero-plotter/legs_tools/zp_summary/deploy/DEPLOY-druid.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=integration-user
+Group=integration-user
+WorkingDirectory=/home/integration-user/zero-plotter/legs_tools/zp_summary
+
+# MSAL のトークンキャッシュは ~/.slack_attachment_reader_msal_cache.bin を見るため
+# HOME を明示する (systemd のシステムユニットでは HOME が設定されない)
+Environment=HOME=/home/integration-user
+# SLACK_BOT_TOKEN / MERGE_LEGS_WEBHOOK_URL などを読み込む。存在しなくても起動する (先頭の -)
+EnvironmentFile=-/home/integration-user/zero-plotter/legs_tools/zp_summary/.env
+
+# 1) Slack/Teams から収集 → /mnt/disks/dropoff/zp_summary/legs_generated.json
+ExecStart=/home/integration-user/zero-plotter/legs_tools/zp_summary/run_zp_summary.sh
+
+# 2) 生成物を本番 legs.json へ追記のみでマージ (差分チェックで異常時は中断)
+#    Type=oneshot の ExecStart は順次実行され、1) が失敗したら 2) は実行されない
+ExecStart=/usr/bin/python3 /home/integration-user/zero-plotter/legs_tools/zp_summary/merge_legs.py \
+    --target /mnt/disks/dropoff/global_data/legs.json \
+    --source /mnt/disks/dropoff/zp_summary/legs_generated.json \
+    --backup-dir /mnt/disks/dropoff/backups/global_data \
+    --max-add 50
+
+TimeoutStartSec=1800
+
+# 書き込みを想定した場所以外は読み取り専用にする
+ProtectSystem=full
+ProtectHome=false
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

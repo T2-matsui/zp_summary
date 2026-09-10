@@ -3,7 +3,6 @@
 
   "channel": ["C0123ABC", "C0456DEF"],
   "limit": 200,
-  "threads": false,
 
   "content_date": "yesterday",
   "_comment_content_date": "yyyy-mm-dd / today / yesterday / tomorrow / N_days_ago / N_days_later",

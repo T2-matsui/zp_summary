@@ -67,6 +67,8 @@ def normalize_trackname(track: str) -> str:
 
 
 IMPORTANT_TAG_RE = re.compile(r'(?:^重要運行[_＿]|[_＿]重要運行$)')
+# rec[1] 末尾の "(往路)" / "(復路)" (同日2便を UI 上で区別するために付けている)
+DIRECTION_SUFFIX_RE = re.compile(r'\((?:往路|復路)\)\s*$')
 
 
 def strip_important_tag(value: str) -> str:
@@ -78,6 +80,20 @@ def strip_important_tag(value: str) -> str:
     slack_attachment_reader.strip_important_tag と同一ロジック。両方を揃えること。
     """
     return IMPORTANT_TAG_RE.sub("", value or "").strip()
+
+
+
+def strip_direction_suffix(value: str) -> str:
+    """rec[1] 末尾の "(往路)" / "(復路)" を取り除く (重複判定でのみ使う)。
+
+    build_legs_record が同日2便を UI 上で区別するために付けているサフィックス。
+    付ける前に本番へ入ったレコードと別キーになって二重登録されるため、比較時に外す。
+    方向はキーの3要素目で持っているので情報は落ちない。
+    時刻サフィックス "(HH:MM)" は外さない。方向が取れない同日2便 (日勤と夜勤など) は
+    それが唯一の区別材料で、外すと2便目が重複扱いでスキップされる。
+    slack_attachment_reader / merge_legs の両方に同じ関数がある。変更する場合は両方を揃えること。
+    """
+    return DIRECTION_SUFFIX_RE.sub("", value or "").strip()
 
 
 def legs_dedup_key(rec) -> tuple:
@@ -100,9 +116,10 @@ def legs_dedup_key(rec) -> tuple:
         return ("", "", "")
     date_str = date_part.split("|", 1)[1] if "|" in date_part else ""
     direction = next((w for w in ("往路", "復路") if w in luggage), "")
-    # 「重要運行」マーカーは比較前に外す (旧形式のレコードとの二重登録を防ぐ)
+    # 「重要運行」マーカーと "(往路)" サフィックスは比較前に外す
+    # (旧形式・サフィックス付与前のレコードとの二重登録を防ぐ)
     return (normalize_trackname(strip_important_tag(track)),
-            strip_important_tag(date_str), direction)
+            strip_direction_suffix(strip_important_tag(date_str)), direction)
 
 
 def dumps_legs(records: list) -> str:

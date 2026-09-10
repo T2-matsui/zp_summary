@@ -1,0 +1,18 @@
+# zp_summary の依存。Python 3.10 以上が必須。
+#   slack_attachment_reader.py が from __future__ import annotations 無しで
+#   PEP 604 の "X | None" を関数シグネチャに使っているため、3.9 以下は import 時に落ちる。
+#
+# 導入 (OS 同梱の requests / PyJWT / cryptography がある環境):
+#     pip3 install --user --no-deps -r requirements.txt
+#
+# --no-deps を付けるのは msal の依存を既存パッケージで満たし、それらに触らせないため。
+# msal の要求は requests<3,>=2.0.0 / PyJWT[crypto]<3,>=1.0.0 / cryptography<51,>=2.5 で、
+# Ubuntu 22.04 同梱の 2.25.1 / 2.3.0 / 3.4.8 はいずれも範囲内。
+# これらが無い環境では --no-deps を外すこと。
+#
+# 親ディレクトリの legs_tools/requirements.txt は別ツール用なので混同しない
+# (slack_sdk と python-dotenv が無く、requests>=2.28.0 と pandas 一式を要求する)。
+
+slack_sdk>=3.20
+python-dotenv>=1.0
+msal>=1.20,<2

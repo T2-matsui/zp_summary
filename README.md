@@ -116,6 +116,17 @@ systemd timer で日次実行し、Slack の Incoming Webhook で開始・完了
 
 過去の legs.json には `重要運行_giga03` (〜2026-07-06 の形式) や日付末尾の `_重要運行` が残っている。重複判定 (`legs_dedup_key`) はこのマーカーを外してから比較するため、同じ運行が二重登録されることはない (`merge_legs.py` 側も同一ロジック)。
 
+### 同日2便と重複判定キー
+
+同じ号車が同じ日に 2 便走ると `rec[1]` (`Track-num|YY/MM/DD`) が同一値になり、`csv_exported/x/main.js` が `rec[1]` をキーに一意化するため UI 上で片方が消える。これを避けるため `rec[1]` の末尾に区別できる情報を付けている。
+
+| 条件 | `rec[1]` の例 |
+|---|---|
+| 会議件名に往路/復路がある | `03\|26/09/03(往路)` |
+| 往路/復路が取れない (日勤と夜勤など) | `03\|26/09/03(20:00)` — Teams 会議の開始時刻。再実行しても同じ値になる |
+
+**重複判定 (`legs_dedup_key`) は `(往路)` `(復路)` だけをキーから外し、`(HH:MM)` は外さない。** 方向はキーの3要素目で持っているため外しても情報は落ちず、サフィックスを付ける前に本番へ入った既存レコードと同一キーになって二重登録を防げる。一方 `(HH:MM)` は方向が取れない同日2便の唯一の区別材料なので、外すと2便目が重複扱いでスキップされる (`merge_legs.py` 側も同一ロジック。**片方だけ変更しないこと**)。
+
 Slack本文が `【重要運行】` で Teams会議件名に号車がある場合は、Teams 側の号車が採用される (これは正常フロー)。**他号車の会議室を流用して投稿された場合は誤った号車が確定するが、判別する材料がないため検知できない。**
 
 ### 号車の絞り込み (`track_filter`)
@@ -187,7 +198,7 @@ Slack本文が `【重要運行】` で Teams会議件名に号車がある場�
 
 | 認証情報 | 用途 | scope/権限 |
 |---|---|---|
-| Slack Bot Token (`xoxb-`) | チャンネル読み取り | `channels:history` `channels:read` `groups:history` `groups:read` `users:read` `incoming-webhook` |
+| Slack Bot Token (`xoxb-`) | チャンネル読み取り | `channels:history` `users:read` (private は `groups:history`)。`channel` にチャンネル**名**を書く場合のみ `channels:read` / `groups:read` も必要 |
 | Slack Webhook URL (開始) | 個人DM通知 | scope不要 (URL自体が認証情報) |
 | Slack Webhook URL (完了) | 運行チャンネル通知 | scope不要 |
 | Microsoft Graph (MSAL) | Teams 会議情報 / ドライバー予定表 | `OnlineMeetings.Read` `Calendars.Read` `Calendars.Read.Shared` |
@@ -254,9 +265,21 @@ Slack本文が `【重要運行】` で Teams会議件名に号車がある場�
 
 ### 2. 依存ライブラリ
 
+**Python 3.10 以上が必須。** `slack_attachment_reader.py` が `from __future__ import
+annotations` 無しで PEP 604 の `X | None` を関数シグネチャに使っているため、3.9 以下は
+import した時点で `TypeError` になる。`python-dotenv` の最新版も `requires_python >= 3.10`。
+
 ```bash
-pip3 install slack_sdk requests msal python-dotenv --break-system-packages
+python3 -V                       # 3.10 以上であること
+pip3 install --user --no-deps -r requirements.txt
 ```
+
+- `--user` は `~/.local/lib/python3.x/site-packages` に入れる指定。システム領域を触らず、
+  `pip3 uninstall` や `rm -rf ~/.local/lib/python3.x/site-packages` で元に戻せる
+- `--no-deps` を付けるのは、`msal` の依存 (`requests` `PyJWT[crypto]` `cryptography`) が
+  OS 同梱版で足りている環境で、既存パッケージに触らせないため。足りない場合は外して実行する
+- **`legs_tools/requirements.txt` は使わないこと。** 別ツール用のファイルで、`slack_sdk` も
+  `python-dotenv` も入っていない一方 `requests>=2.28.0` と pandas 一式を要求する
 
 ### 3. `.env` 作成
 
@@ -880,9 +903,13 @@ TOKEN=$(grep '^SLACK_BOT_TOKEN' .env | cut -d= -f2 | tr -d '"' | tr -d ' ' | tr 
 curl -s -X POST "https://slack.com/api/auth.test" -H "Authorization: Bearer $TOKEN" -i | grep -i "x-oauth-scopes"
 ```
 
-必要なscope: `channels:history` `channels:read` `groups:history` `groups:read` `users:read` `incoming-webhook`
+必要なscope: `channels:history` `users:read` (private チャンネルは `groups:history`)
 
-- public チャンネルは `channels:history` / `channels:read`
+`config.json` の `channel` にチャンネル ID (`C…`) を直接書いている場合、`resolve_channel_id`
+は `conversations.list` を呼ばないため `channels:read` / `groups:read` は不要。チャンネル**名**
+で指定する場合だけ追加する。
+
+- public チャンネルは `channels:history`
 - **private チャンネルは `groups:history` / `groups:read` が必須**。`conversations.info` すら `missing_scope` を返す場合は対象が private の可能性が高い
 
 不足があれば Slack App画面で **Bot Token Scopes** に追加 → **reinstall your app** → 新トークンを `.env` に反映。private チャンネルでは Bot がメンバーである必要もある (`/invite @アプリ名`)。

@@ -90,7 +90,7 @@ def extract_teams_urls(msg: dict) -> list[str]:
 def get_token() -> str:
     token = os.environ.get("SLACK_TOKEN") or os.environ.get("SLACK_BOT_TOKEN")
     if not token:
-        sys.exit("環境変数 SLACK_TOKEN (xoxp-...) が設定されていません。")
+        sys.exit("環境変数 SLACK_BOT_TOKEN (xoxb-...) が設定されていません。")
     return token
 
 
@@ -345,6 +345,14 @@ def get_graph_token(extra_scopes: list[str] | None = None) -> str:
     if accounts:
         result = app.acquire_token_silent(scopes, account=accounts[0])
     if not result:
+        # 非対話 (systemd / cron) でデバイスコード認証に入ると、誰もコードを入力
+        # しないまま有効期限の 900 秒までポーリングし続ける。再認証が必要になった
+        # 日から毎日ハングして無言で失敗するので、先に打ち切って原因を明示する
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Microsoft の再認証が必要ですが、非対話実行のため完了できません。"
+                "端末から ./run_zp_summary.sh を実行してデバイスコード認証を通し直して"
+                f"ください (キャッシュ: {MSAL_CACHE_FILE})")
         flow = app.initiate_device_flow(scopes=scopes)
         if "user_code" not in flow:
             raise RuntimeError(f"Device flow開始失敗: {flow}")
@@ -355,8 +363,13 @@ def get_graph_token(extra_scopes: list[str] | None = None) -> str:
     if "access_token" not in result:
         raise RuntimeError(f"トークン取得失敗: {result.get('error_description', result)}")
     if cache.has_state_changed:
-        with open(MSAL_CACHE_FILE, "w") as f:
+        # 中身はリフレッシュトークン。druid は sudo 可能な利用者が複数いるため、
+        # .env と同じく本人のみ読める権限で作る (O_CREAT のモードは新規作成時
+        # にしか効かないので、既存ファイル向けに chmod も行う)
+        fd = os.open(MSAL_CACHE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w") as f:
             f.write(cache.serialize())
+        os.chmod(MSAL_CACHE_FILE, 0o600)
     return result["access_token"]
 
 
@@ -511,6 +524,14 @@ def apply_teams_meeting(meta: dict, meeting: dict, debug: bool = False) -> None:
 
 # ---------- legs.json レコード ----------
 
+def _direction_of(luggage: str) -> str:
+    """loaded_luggage から運行方向 (往路/復路) を取り出す。無ければ空文字。
+
+    legs_dedup_key が重複判定に使うのと同じ語を見る。
+    """
+    return next((w for w in ("往路", "復路") if w in (luggage or "")), "")
+
+
 def build_legs_record(meta: dict, url: str) -> list:
     """legs.json レコード [Trackname, "Track-num|YY/MM/DD", "開始ISO/終了ISO",
     {SW-version, selfdrive_section, loaded_luggage, url}] を作る (跨日OK)。"""
@@ -534,6 +555,18 @@ def build_legs_record(meta: dict, url: str) -> list:
         return re.sub(r"^\s*【\s*giga\d+\s*】\s*", "", v, flags=re.IGNORECASE)
 
     track = normalize_trackname(track)
+    luggage = _strip_giga_tag(_giga(meta.get("Customer", "")))
+
+    # 同日 2 便は leg[1] が同一値になり、csv_exported/x/main.js が leg[1] をキーに
+    # 一意化するため UI 上で片方が消える。区別できる情報を leg[1] に含める
+    direction = _direction_of(luggage)
+    if date_str and direction:
+        date_str = f"{date_str}({direction})"
+    elif date_str and teams_start:
+        # 方向が取れない同日 2 便 (日勤と夜勤など) は開始時刻で分ける。開始時刻は
+        # Teams 会議から取るので再実行しても同じ値になり、重複スキップは効いたままになる
+        date_str = f"{date_str}({teams_start.strftime('%H:%M')})"
+
     # 「重要運行」は loaded_luggage の【gigaXX】から番号を拾って Trackname=gigaXX に補正する。
     # 「重要運行」であること自体はレコードに残さない (下流 zero-plotter が Trackname を
     # 号車ID としてそのまま使っており、giga03 以外の値にすると Druid のデータソース名・
@@ -552,7 +585,7 @@ def build_legs_record(meta: dict, url: str) -> list:
         {
             "SW-version": meta.get("SW-ver", ""),
             "selfdrive_section": meta.get("Route", ""),
-            "loaded_luggage": _strip_giga_tag(_giga(meta.get("Customer", ""))),
+            "loaded_luggage": luggage,
             "url": url,
         },
     ]
@@ -591,6 +624,8 @@ def is_legs_record_complete(rec) -> tuple[bool, list]:
 
 
 IMPORTANT_TAG_RE = re.compile(r'(?:^重要運行[_＿]|[_＿]重要運行$)')
+# rec[1] 末尾の "(往路)" / "(復路)" (同日2便を UI 上で区別するために付けている)
+DIRECTION_SUFFIX_RE = re.compile(r'\((?:往路|復路)\)\s*$')
 
 
 def strip_important_tag(value: str) -> str:
@@ -602,6 +637,20 @@ def strip_important_tag(value: str) -> str:
     merge_legs.py 側にも同じ関数がある。変更する場合は両方を揃えること。
     """
     return IMPORTANT_TAG_RE.sub("", value or "").strip()
+
+
+
+def strip_direction_suffix(value: str) -> str:
+    """rec[1] 末尾の "(往路)" / "(復路)" を取り除く (重複判定でのみ使う)。
+
+    build_legs_record が同日2便を UI 上で区別するために付けているサフィックス。
+    付ける前に本番へ入ったレコードと別キーになって二重登録されるため、比較時に外す。
+    方向はキーの3要素目で持っているので情報は落ちない。
+    時刻サフィックス "(HH:MM)" は外さない。方向が取れない同日2便 (日勤と夜勤など) は
+    それが唯一の区別材料で、外すと2便目が重複扱いでスキップされる。
+    slack_attachment_reader / merge_legs の両方に同じ関数がある。変更する場合は両方を揃えること。
+    """
+    return DIRECTION_SUFFIX_RE.sub("", value or "").strip()
 
 
 def legs_dedup_key(rec) -> tuple:
@@ -624,9 +673,10 @@ def legs_dedup_key(rec) -> tuple:
         return ("", "", "")
     date_str = date_part.split("|", 1)[1] if "|" in date_part else ""
     direction = next((w for w in ("往路", "復路") if w in liggage), "")
-    # 「重要運行」マーカーは比較前に外す (旧形式のレコードとの二重登録を防ぐ)
+    # 「重要運行」マーカーと "(往路)" サフィックスは比較前に外す
+    # (旧形式・サフィックス付与前のレコードとの二重登録を防ぐ)
     return (normalize_trackname(strip_important_tag(track)),
-            strip_important_tag(date_str), direction)
+            strip_direction_suffix(strip_important_tag(date_str)), direction)
 
 
 # ---------- I/O ----------
@@ -685,8 +735,12 @@ def load_logs_json(path: str) -> tuple[list, "date | None"]:
 
 
 def atomic_write_json(path: str, data) -> None:
-    """一時ファイルに書いてから os.replace で差し替え (書き込み中クラッシュでも元は無傷)。"""
+    """一時ファイルに書いてから os.replace で差し替え (書き込み中クラッシュでも元は無傷)。
+
+    出力先の親ディレクトリが無ければ作る (merge_legs.make_backup と同じ流儀)。
+    """
     p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -910,6 +964,8 @@ def parse_args() -> argparse.Namespace:
 
     known = {a.dest for a in p._actions}
     for key in config:
+        if key.startswith("_"):  # "_comment..." は雛形の注釈なので警告しない
+            continue
         if key not in known:
             log(f"[警告] 設定ファイルの未知のキー: {key}")
     p.set_defaults(**{k: v for k, v in config.items() if k in known})
@@ -1015,7 +1071,16 @@ def run(args: argparse.Namespace, state: dict) -> int:
     extra_scopes = ["OnlineMeetings.Read", "Calendars.Read"]
     if args.track_calendars:
         extra_scopes.append("Calendars.Read.Shared")
-    graph_token = get_graph_token(extra_scopes=extra_scopes)
+    try:
+        graph_token = get_graph_token(extra_scopes=extra_scopes)
+    except Exception as e:
+        # 開始通知だけ届いて以降が無音になると気づきにくいので、ここで失敗を伝える
+        log(f"[異常] Microsoft Graph のトークン取得に失敗: {e}")
+        if args.notify_webhook_url:
+            send_slack_notification(
+                args.notify_webhook_url,
+                f"❌ zp_summary: Microsoft Graph の認証に失敗しました: {e}")
+        sys.exit(1)
 
     track_event_map: dict = {}
     if graph_token and args.track_calendars:
@@ -1163,6 +1228,7 @@ def run(args: argparse.Namespace, state: dict) -> int:
         log(f"[append] 新規 {legs_new_count} 件、重複スキップ {skipped_count + legs_skipped_count} 件")
 
     # 出力: --out / 標準出力 / legs.json (いずれも final_legs)
+    legs_write_failed = False
     if args.out:
         atomic_write_json(args.out, final_legs)
         log(f"結果を {args.out} に保存しました。")
@@ -1174,13 +1240,19 @@ def run(args: argparse.Namespace, state: dict) -> int:
             log(f"[legs] {args.legs_out} に保存 (新規 {legs_new_count} / 重複スキップ "
                 f"{legs_skipped_count} / 累計 {len(final_legs)} 件)")
         except Exception as e:
-            # 保存できていないのに ✅ success が飛ばないよう errors に積む
+            # 保存できていないのに ✅ success が飛ばないよう errors に積む。
+            # errors が 1 件でもあれば main() が非ゼロ終了するので、systemd の
+            # 2 段目 (merge_legs) は動かない (元の sys.exit(1) と同じ効果。
+            # ここで exit すると main() のクラッシュ通知と二重に Slack へ飛ぶ)
             log(f"[エラー] legs.json 出力エラー: {e}")
             errors.append(f"{args.legs_out} の保存に失敗しました "
                           f"(運行記録 {legs_new_count} 件が未保存): {type(e).__name__}: {e}")
+            legs_write_failed = True
 
-    # logs.json: 今回処理した投稿の投稿日履歴を追記
-    if args.logs_out:
+    # logs.json: 今回処理した投稿の投稿日履歴を追記。
+    # legs.json の保存に失敗したときは書かない。書くと次回の since が進み、
+    # 未保存の運行が二度と取り込まれないまま取得範囲から外れる
+    if args.logs_out and not legs_write_failed:
         try:
             seen_urls = {e.get("url") for e in existing_logs
                          if isinstance(e, dict) and e.get("url")}
