@@ -1042,7 +1042,8 @@ def run(args: argparse.Namespace, state: dict) -> int:
             if track_allow:
                 rec_track = rec[0] if isinstance(rec, list) and rec \
                     else (rec.get("Trackname", "") if isinstance(rec, dict) else "")
-                if not track_allowed(rec_track, track_allow):
+                # 旧形式 '重要運行_giga06' はマーカーを外さないと号車が読めない
+                if not track_allowed(strip_important_tag(rec_track), track_allow):
                     existing_dropped += 1
                     log(f"[legs] 対象外号車のため既存レコードを除外: 【{rec_track}】")
                     continue
